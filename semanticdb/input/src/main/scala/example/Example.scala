@@ -14,4 +14,9 @@ class Example {
       x +
       y
     )
+  var b = 4
+}
+
+class ExampleInit {
+
 }

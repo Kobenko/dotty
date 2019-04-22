@@ -8,8 +8,10 @@ import collection.mutable
 import printing.Printer
 import printing.Texts._
 import config.Config
+import config.Printers.constr
 import reflect.ClassTag
 import annotation.tailrec
+import annotation.internal.sharable
 
 object OrderingConstraint {
 
@@ -102,6 +104,9 @@ object OrderingConstraint {
       newConstraint(c.boundsMap, c.lowerMap, c.upperMap.updated(poly, entries))
     def initial = Nil
   }
+
+  @sharable
+  val empty = new OrderingConstraint(SimpleIdentityMap.Empty, SimpleIdentityMap.Empty, SimpleIdentityMap.Empty)
 }
 
 import OrderingConstraint._
@@ -162,8 +167,6 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
     entries != null && isBounds(entries(pnum)) && (typeVar(entries, pnum) eq tvar)
   }
 
-  private def isBounds(tp: Type) = tp.isInstanceOf[TypeBounds]
-
 // ---------- Dependency handling ----------------------------------------------
 
   def lower(param: TypeParamRef): List[TypeParamRef] = lowerLens(this, param.binder, param.paramNum)
@@ -221,7 +224,7 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
   def dependentParams(tp: Type, isUpper: Boolean): List[TypeParamRef] = tp match {
     case param: TypeParamRef if contains(param) =>
       param :: (if (isUpper) upper(param) else lower(param))
-    case tp: AndType => dependentParams(tp.tp1, isUpper).union    (dependentParams(tp.tp2, isUpper))
+    case tp: AndType => dependentParams(tp.tp1, isUpper) | (dependentParams(tp.tp2, isUpper))
     case tp: OrType  => dependentParams(tp.tp1, isUpper).intersect(dependentParams(tp.tp2, isUpper))
     case _ =>
       Nil
@@ -325,8 +328,8 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
   private def order(current: This, param1: TypeParamRef, param2: TypeParamRef)(implicit ctx: Context): This =
     if (param1 == param2 || current.isLess(param1, param2)) this
     else {
-      assert(contains(param1))
-      assert(contains(param2))
+      assert(contains(param1), i"$param1")
+      assert(contains(param2), i"$param2")
       val newUpper = param2 :: exclusiveUpper(param2, param1)
       val newLower = param1 :: exclusiveLower(param1, param2)
       val current1 = (current /: newLower)(upperLens.map(this, _, _, newUpper ::: _))
@@ -501,6 +504,7 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
     }
 
   def & (other: Constraint, otherHasErrors: Boolean)(implicit ctx: Context): OrderingConstraint = {
+
     def merge[T](m1: ArrayValuedMap[T], m2: ArrayValuedMap[T], join: (T, T) => T): ArrayValuedMap[T] = {
       var merged = m1
       def mergeArrays(xs1: Array[T], xs2: Array[T]) = {
@@ -525,7 +529,7 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
         case (e1: TypeBounds, e2: TypeBounds) => e1 & e2
         case (e1: TypeBounds, _) if e1 contains e2 => e2
         case (_, e2: TypeBounds) if e2 contains e1 => e1
-        case (tv1: TypeVar, tv2: TypeVar) if tv1.instanceOpt eq tv2.instanceOpt => e1
+        case (tv1: TypeVar, tv2: TypeVar) if tv1 eq tv2 => e1
         case _ =>
           if (otherHasErrors)
             e1
@@ -533,12 +537,62 @@ class OrderingConstraint(private val boundsMap: ParamBounds,
             throw new AssertionError(i"cannot merge $this with $other, mergeEntries($e1, $e2) failed")
       }
 
-    val that = other.asInstanceOf[OrderingConstraint]
+    /** Ensure that constraint `c` does not associate different TypeVars for the
+     *  same type lambda than this constraint. Do this by renaming type lambdas
+     *  in `c` where necessary.
+     */
+    def ensureNotConflicting(c: OrderingConstraint): OrderingConstraint = {
+      def hasConflictingTypeVarsFor(tl: TypeLambda) =
+        this.typeVarOfParam(tl.paramRefs(0)) ne c.typeVarOfParam(tl.paramRefs(0))
+          // Note: Since TypeVars are allocated in bulk for each type lambda, we only
+          // have to check the first one to find out if some of them are different.
+      val conflicting = c.domainLambdas.find(tl =>
+        this.contains(tl) && hasConflictingTypeVarsFor(tl))
+      conflicting match {
+        case Some(tl) => ensureNotConflicting(c.rename(tl))
+        case None => c
+      }
+    }
+
+    val that = ensureNotConflicting(other.asInstanceOf[OrderingConstraint])
+
     new OrderingConstraint(
         merge(this.boundsMap, that.boundsMap, mergeEntries),
         merge(this.lowerMap, that.lowerMap, mergeParams),
         merge(this.upperMap, that.upperMap, mergeParams))
+  }.reporting(res => i"constraint merge $this with $other = $res", constr)
+
+  def rename(tl: TypeLambda)(implicit ctx: Context): OrderingConstraint = {
+    assert(contains(tl))
+    val tl1 = ensureFresh(tl)
+    def swapKey[T](m: ArrayValuedMap[T]) = m.remove(tl).updated(tl1, m(tl))
+    var current = newConstraint(swapKey(boundsMap), swapKey(lowerMap), swapKey(upperMap))
+    def subst[T <: Type](x: T): T = x.subst(tl, tl1).asInstanceOf[T]
+    current.foreachParam {(p, i) =>
+      current = boundsLens.map(this, current, p, i, subst)
+      current = lowerLens.map(this, current, p, i, _.map(subst))
+      current = upperLens.map(this, current, p, i, _.map(subst))
+    }
+    current.foreachTypeVar { tvar =>
+      val TypeParamRef(binder, n) = tvar.origin
+      if (binder eq tl) tvar.setOrigin(tl1.paramRefs(n))
+    }
+    constr.println(i"renamd $this to $current")
+    current
   }
+
+  def ensureFresh(tl: TypeLambda)(implicit ctx: Context): TypeLambda =
+    if (contains(tl)) {
+      var paramInfos = tl.paramInfos
+      if (tl.isInstanceOf[HKLambda]) {
+        // HKLambdas are hash-consed, need to create an artificial difference by adding
+        // a LazyRef to a bound.
+        val TypeBounds(lo, hi) :: pinfos1 = tl.paramInfos
+        paramInfos = TypeBounds(lo, LazyRef(_ => hi)) :: pinfos1
+      }
+      ensureFresh(tl.newLikeThis(tl.paramNames, paramInfos, tl.resultType))
+    }
+    else tl
 
   override def checkClosed()(implicit ctx: Context): Unit = {
     def isFreeTypeParamRef(tp: Type) = tp match {

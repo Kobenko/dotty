@@ -1,6 +1,8 @@
 package dotty.tools.languageserver.util.server
 
-import dotty.tools.languageserver.worksheet.{WorksheetRunOutput, WorksheetClient}
+import dotty.tools.languageserver.worksheet.{WorksheetRunOutput}
+import dotty.tools.languageserver.DottyClient
+
 
 import java.util.concurrent.CompletableFuture
 
@@ -9,7 +11,7 @@ import org.eclipse.lsp4j.services._
 
 import scala.collection.mutable.Buffer
 
-class TestClient extends WorksheetClient {
+class TestClient extends DottyClient {
 
   class Log[T] {
     private[this] val log = Buffer.empty[T]
@@ -23,6 +25,7 @@ class TestClient extends WorksheetClient {
   val diagnostics = new Log[PublishDiagnosticsParams]
   val telemetry = new Log[Any]
   val worksheetOutput = new Log[WorksheetRunOutput]
+  val requests = new Log[(ShowMessageRequestParams, CompletableFuture[MessageActionItem])]
 
   override def logMessage(message: MessageParams) = {
     log += message
@@ -37,8 +40,9 @@ class TestClient extends WorksheetClient {
   }
 
   override def showMessageRequest(requestParams: ShowMessageRequestParams) = {
-    log += requestParams
-    new CompletableFuture[MessageActionItem]
+    val reply = new CompletableFuture[MessageActionItem]
+    requests += ((requestParams, reply))
+    reply
   }
 
   override def publishDiagnostics(diagnosticsParams: PublishDiagnosticsParams) = {

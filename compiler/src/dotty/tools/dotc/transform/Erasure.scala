@@ -135,7 +135,7 @@ class Erasure extends Phase with DenotTransformer {
 
   def assertErased(tp: Type, tree: tpd.Tree = tpd.EmptyTree)(implicit ctx: Context): Unit = {
     def isAllowed(cls: Symbol, sourceName: String) =
-      tp.typeSymbol == cls && ctx.compilationUnit.source.file.name == sourceName
+      tp.widen.typeSymbol == cls && ctx.compilationUnit.source.file.name == sourceName
     assert(isErasedType(tp) ||
            isAllowed(defn.ArrayClass, "Array.scala") ||
            isAllowed(defn.TupleClass, "Tuple.scala") ||
@@ -180,8 +180,7 @@ object Erasure {
     }
 
     def constant(tree: Tree, const: Tree)(implicit ctx: Context): Tree =
-      (if (isPureExpr(tree)) const else Block(tree :: Nil, const))
-        .withPos(tree.pos)
+      (if (isPureExpr(tree)) const else Block(tree :: Nil, const)).withSpan(tree.span)
 
     final def box(tree: Tree, target: => String = "")(implicit ctx: Context): Tree = trace(i"boxing ${tree.showSummary}: ${tree.tpe} into $target") {
       tree.tpe.widen match {
@@ -320,9 +319,15 @@ object Erasure {
   class Typer(erasurePhase: DenotTransformer) extends typer.ReTyper with NoChecking {
     import Boxing._
 
+    def isErased(tree: Tree)(implicit ctx: Context): Boolean = tree match {
+      case TypeApply(Select(qual, _), _) if tree.symbol == defn.Any_typeCast =>
+        isErased(qual)
+      case _ => tree.symbol.isEffectivelyErased
+    }
+
     private def checkNotErased(tree: Tree)(implicit ctx: Context): tree.type = {
-      if (tree.symbol.isEffectivelyErased && !ctx.mode.is(Mode.Type))
-        ctx.error(em"${tree.symbol} is declared as erased, but is in fact used", tree.pos)
+      if (isErased(tree) && !ctx.mode.is(Mode.Type))
+        ctx.error(em"${tree.symbol} is declared as erased, but is in fact used", tree.sourcePos)
       tree
     }
 
@@ -353,9 +358,13 @@ object Erasure {
     /** This override is only needed to semi-erase type ascriptions */
     override def typedTyped(tree: untpd.Typed, pt: Type)(implicit ctx: Context): Tree = {
       val Typed(expr, tpt) = tree
-      val tpt1 = promote(tpt)
-      val expr1 = typed(expr, tpt1.tpe)
-      assignType(untpd.cpy.Typed(tree)(expr1, tpt1), tpt1)
+      val tpt1 = tpt match {
+        case Block(_, tpt) => tpt // erase type aliases (statements) from type block
+        case tpt => tpt
+      }
+      val tpt2 = promote(tpt1)
+      val expr1 = typed(expr, tpt2.tpe)
+      assignType(untpd.cpy.Typed(tree)(expr1, tpt2), tpt2)
     }
 
     override def typedLiteral(tree: untpd.Literal)(implicit ctx: Context): Tree =
@@ -398,9 +407,9 @@ object Erasure {
 
       def mapOwner(sym: Symbol): Symbol = {
         def recur(owner: Symbol): Symbol =
-          if (defn.erasedToObject.contains(owner)) {
+          if (defn.specialErasure.contains(owner)) {
             assert(sym.isConstructor, s"${sym.showLocated}")
-            defn.ObjectClass
+            defn.specialErasure(owner)
           } else if (defn.isSyntheticFunctionClass(owner))
             defn.erasedFunctionClass(owner)
           else
@@ -502,7 +511,7 @@ object Erasure {
       val Apply(fun, args) = tree
       if (fun.symbol == defn.cbnArg)
         typedUnadapted(args.head, pt)
-      else typedExpr(fun, FunProto(args, pt)(this)) match {
+      else typedExpr(fun, FunProto(args, pt)(this, isContextual = false)) match {
         case fun1: Apply => // arguments passed in prototype were already passed
           fun1
         case fun1 =>
@@ -559,7 +568,7 @@ object Erasure {
       if (sym.isEffectivelyErased) erasedDef(sym)
       else
         super.typedValDef(untpd.cpy.ValDef(vdef)(
-          tpt = untpd.TypedSplice(TypeTree(sym.info).withPos(vdef.tpt.pos))), sym)
+          tpt = untpd.TypedSplice(TypeTree(sym.info).withSpan(vdef.tpt.span))), sym)
 
     /** Besides normal typing, this function also compacts anonymous functions
      *  with more than `MaxImplementedFunctionArity` parameters to use a single
@@ -592,7 +601,7 @@ object Erasure {
         val ddef1 = untpd.cpy.DefDef(ddef)(
           tparams = Nil,
           vparamss = vparamss1,
-          tpt = untpd.TypedSplice(TypeTree(restpe).withPos(ddef.tpt.pos)),
+          tpt = untpd.TypedSplice(TypeTree(restpe).withSpan(ddef.tpt.span)),
           rhs = rhs1)
         super.typedDefDef(ddef1, sym)
       }

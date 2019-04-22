@@ -12,7 +12,7 @@ object definitions {
 
   case class PackageClause(pkg: Term, body: List[Tree]) extends Tree
 
-  case class Import(expr: Term, selector: List[ImportSelector]) extends Statement
+  case class Import(importImplied: Boolean, expr: Term, selector: List[ImportSelector]) extends Statement
 
   enum ImportSelector {
     case SimpleSelector(id: Id)
@@ -246,7 +246,7 @@ object definitions {
     def isMutable: Boolean               // when used on a ValDef: a var
     def isLabel: Boolean                 // method generated as a label
     def isFieldAccessor: Boolean         // a getter or setter
-    def isCaseAcessor: Boolean           // getter for class parameter
+    def isCaseAccessor: Boolean          // getter for class parameter
     def isCovariant: Boolean             // type parameter marked “+”
     def isContravariant: Boolean         // type parameter marked “-”
     def isScala2X: Boolean               // Imported from Scala2.x
@@ -348,7 +348,7 @@ object ReflectionImpl extends Tasty {
   import dotty.tools.dotc._
   import ast.tpd
   import core.{Types, Symbols, Contexts}
-  import util.{Positions}
+  import util.Spans
 
   type Type = Types.Type
   implicit class TypeDeco(x: Type) extends TypeAPI {}
@@ -361,7 +361,7 @@ object ReflectionImpl extends Tasty {
     val owner = c.owner
   }
 
-  type Position = Positions.Position
+  type Position = Spans.Span
   implicit class PositionDeco(p: Position) extends PositionAPI {
     val start = p.start
     val end = p.end
@@ -369,19 +369,19 @@ object ReflectionImpl extends Tasty {
 
   type Pattern = tpd.Tree
   implicit class PatternDeco(p: Pattern) extends TypedPositioned {
-    val pos = p.pos
+    val pos = p.span
     val tpe = p.tpe
   }
 
   type Term = tpd.Tree
   implicit class TermDeco(t: Term) extends TypedPositioned {
-    val pos = t.pos
+    val pos = t.span
     val tpe = t.tpe
   }
 
   type CaseDef = tpd.CaseDef
   implicit class CaseDefDeco(c: CaseDef) extends TypedPositioned {
-    val pos = c.pos
+    val pos = c.span
     val tpe = c.tpe
   }
 

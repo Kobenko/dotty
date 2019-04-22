@@ -80,9 +80,33 @@ This will run both the test `./tests/pos/companions.scala` and
 `./tests/neg/companions.scala` since both of these match the given string.
 This also means that you could run `testCompilation` with no arguments to run all integration tests.
 
+When complex checkfiles must be updated, `testCompilation` can run in a mode where it overrides the checkfiles with the test outputs.
+```bash
+$ sbt
+> testCompilation --update-checkfiles
+```
+
+Use `--help` to see all the options
+```bash
+$ sbt
+> testCompilation --help
+```
+
 ### Bootstrapped-only tests
 
 To run `testCompilation` on a bootstrapped Dotty compiler, use
 `dotty-compiler-bootstrapped/testCompilation` (with the same syntax as above).
 Some tests can only be run in bootstrapped compilers; that includes all tests
 with `with-compiler` in their name.
+
+### From TASTy tests
+
+`testCompilation` has an additional mode to run tests that compile code from a `.tasty` file.
+ Modify blacklist and whitelists in `compiler/test/dotc` to enable or disable tests from `.tasty` files.
+
+ ```bash
+ $ sbt
+ > testCompilation --from-tasty
+ ```
+ 
+ This mode can be run under `dotty-compiler-bootstrapped/testCompilation` to test on a bootstrapped Dotty compiler.

@@ -1,11 +1,12 @@
 import scala.quoted._
+import scala.quoted.autolift._
 
 import scala.tasty._
 
 object Macros {
 
   implicit inline def printOwners[T](x: => T): Unit =
-    ~impl('(x))
+    ${ impl('x) }
 
   def impl[T](x: Expr[T])(implicit reflect: Reflection): Expr[Unit] = {
     import reflect._
@@ -14,9 +15,9 @@ object Macros {
 
     implicit class SymOps(sym: Symbol) {
       def treeOpt: Option[Tree] = sym match {
-        case IsClassSymbol(sym) => Some(sym.tree)
-        case IsDefSymbol(sym) => Some(sym.tree)
-        case IsValSymbol(sym) => Some(sym.tree)
+        case IsClassDefSymbol(sym) => Some(sym.tree)
+        case IsDefDefSymbol(sym) => Some(sym.tree)
+        case IsValDefSymbol(sym) => Some(sym.tree)
         case _ => None
       }
     }
@@ -27,12 +28,12 @@ object Macros {
           case IsDefinition(tree @ DefDef(name, _, _, _, _)) =>
             buff.append(name)
             buff.append("\n")
-            buff.append(tree.symbol.owner.treeOpt.get.show)
+            buff.append(tree.symbol.owner.treeOpt.get.showExtractors)
             buff.append("\n\n")
           case IsDefinition(tree @ ValDef(name, _, _)) =>
             buff.append(name)
             buff.append("\n")
-            buff.append(tree.symbol.owner.treeOpt.get.show)
+            buff.append(tree.symbol.owner.treeOpt.get.showExtractors)
             buff.append("\n\n")
           case _ =>
         }
@@ -40,9 +41,9 @@ object Macros {
       }
     }
 
-    val tree = x.reflect
+    val tree = x.unseal
     output.traverseTree(tree)
-    '(print(~buff.result().toExpr))
+    '{print(${buff.result()})}
   }
 
 }

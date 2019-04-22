@@ -1,6 +1,5 @@
 import scala.quoted._
-
-import scala.quoted.Toolbox.Default._
+import scala.quoted.autolift._
 
 enum Exp {
   case Num(n: Int)
@@ -14,12 +13,12 @@ object Test {
 
   def compile(e: Exp, env: Map[String, Expr[Int]], keepLets: Boolean): Expr[Int] = {
     def compileImpl(e: Exp, env: Map[String, Expr[Int]]): Expr[Int] = e match {
-      case Num(n) => n.toExpr
-      case Plus(e1, e2) => '(~compileImpl(e1, env) + ~compileImpl(e2, env))
+      case Num(n) => n
+      case Plus(e1, e2) => '{${compileImpl(e1, env)} + ${compileImpl(e2, env)}}
       case Var(x) => env(x)
       case Let(x, e, body) =>
         if (keepLets)
-          '{ val y = ~compileImpl(e, env); ~compileImpl(body, env + (x -> '(y))) }
+          '{ val y = ${compileImpl(e, env)}; ${compileImpl(body, env + (x -> 'y)) } }
         else
           compileImpl(body, env + (x -> compileImpl(e, env)))
     }
@@ -28,10 +27,11 @@ object Test {
 
 
   def main(args: Array[String]): Unit = {
+    implicit val toolbox: scala.quoted.Toolbox = scala.quoted.Toolbox.make(getClass.getClassLoader)
     val exp = Plus(Plus(Num(2), Var("x")), Num(4))
     val letExp = Let("x", Num(3), exp)
 
-    val res1 = '{ (x: Int) => ~compile(exp, Map("x" -> '(x)), false) }
+    val res1 = '{ (x: Int) => ${compile(exp, Map("x" -> 'x), false)} }
 
 
     println(res1.show)

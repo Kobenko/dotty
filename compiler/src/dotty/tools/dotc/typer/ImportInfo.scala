@@ -13,24 +13,27 @@ import printing.Texts.Text
 
 object ImportInfo {
   /** The import info for a root import from given symbol `sym` */
-  def rootImport(refFn: () => TermRef)(implicit ctx: Context): ImportInfo = {
+  def rootImport(refFn: () => TermRef, importImplied: Boolean = false)(implicit ctx: Context): ImportInfo = {
     val selectors = untpd.Ident(nme.WILDCARD) :: Nil
     def expr(implicit ctx: Context) = tpd.Ident(refFn())
-    def imp(implicit ctx: Context) = tpd.Import(expr, selectors)
-    new ImportInfo(implicit ctx => imp.symbol, selectors, None, isRootImport = true)
+    def imp(implicit ctx: Context) = tpd.Import(importImplied = importImplied, expr, selectors)
+    new ImportInfo(implicit ctx => imp.symbol, selectors, None, importImplied = importImplied, isRootImport = true)
   }
 }
 
 /** Info relating to an import clause
- *  @param   sym          The import symbol defined by the clause
- *  @param   selectors    The selector clauses
- *  @param   symNameOpt   Optionally, the name of the import symbol. None for root imports.
- *                        Defined for all explicit imports from ident or select nodes.
- *  @param   isRootImport true if this is one of the implicit imports of scala, java.lang,
- *                        scala.Predef or dotty.DottyPredef in the start context, false otherwise.
+ *  @param   sym           The import symbol defined by the clause
+ *  @param   selectors     The selector clauses
+ *  @param   symNameOpt    Optionally, the name of the import symbol. None for root imports.
+ *                         Defined for all explicit imports from ident or select nodes.
+ *  @param   importImplied true if this is an implied import
+ *  @param   isRootImport  true if this is one of the implicit imports of scala, java.lang,
+ *                         scala.Predef or dotty.DottyPredef in the start context, false otherwise.
  */
 class ImportInfo(symf: Context => Symbol, val selectors: List[untpd.Tree],
-                 symNameOpt: Option[TermName], val isRootImport: Boolean = false) extends Showable {
+                 symNameOpt: Option[TermName],
+                 val importImplied: Boolean,
+                 val isRootImport: Boolean = false) extends Showable {
 
   // Dotty deviation: we cannot use a lazy val here for the same reason
   // that we cannot use one for `DottyPredefModuleRef`.
@@ -44,9 +47,9 @@ class ImportInfo(symf: Context => Symbol, val selectors: List[untpd.Tree],
   private[this] var mySym: Symbol = _
 
   /** The (TermRef) type of the qualifier of the import clause */
-  def site(implicit ctx: Context): Type = {
-    val ImportType(expr) = sym.info
-    expr.tpe
+  def site(implicit ctx: Context): Type = sym.info match {
+    case ImportType(expr) => expr.tpe
+    case _ => NoType
   }
 
   /** The names that are excluded from any wildcard import */
@@ -92,17 +95,21 @@ class ImportInfo(symf: Context => Symbol, val selectors: List[untpd.Tree],
     recur(selectors)
   }
 
+  private def implicitFlag(implicit ctx: Context) =
+    if (importImplied || ctx.mode.is(Mode.FindHiddenImplicits)) ImplicitOrImplied
+    else Implicit
+
   /** The implicit references imported by this import clause */
   def importedImplicits(implicit ctx: Context): List[ImplicitRef] = {
     val pre = site
     if (isWildcardImport) {
-      val refs = pre.implicitMembers
+      val refs = pre.implicitMembers(implicitFlag)
       if (excluded.isEmpty) refs
       else refs filterNot (ref => excluded contains ref.name.toTermName)
     } else
       for {
         renamed <- reverseMapping.keys
-        denot <- pre.member(reverseMapping(renamed)).altsWith(_ is Implicit)
+        denot <- pre.member(reverseMapping(renamed)).altsWith(_ is implicitFlag)
       } yield {
         val original = reverseMapping(renamed)
         val ref = TermRef(pre, original, denot)
@@ -139,15 +146,15 @@ class ImportInfo(symf: Context => Symbol, val selectors: List[untpd.Tree],
   private[this] var myUnimported: Symbol = _
 
   /** Does this import clause or a preceding import clause import `owner.feature`? */
-  def featureImported(owner: Symbol, feature: TermName)(implicit ctx: Context): Boolean = {
+  def featureImported(feature: TermName, owner: Symbol)(implicit ctx: Context): Boolean = {
     def compute = {
-      val isImportOwner = site.widen.typeSymbol `eq` owner
+      val isImportOwner = site.widen.typeSymbol.eq(owner)
       if (isImportOwner && originals.contains(feature)) true
       else if (isImportOwner && excluded.contains(feature)) false
       else {
         var c = ctx.outer
         while (c.importInfo eq ctx.importInfo) c = c.outer
-        (c.importInfo != null) && c.importInfo.featureImported(owner, feature)(c)
+        (c.importInfo != null) && c.importInfo.featureImported(feature, owner)(c)
       }
     }
     if (lastOwner.ne(owner) || !lastResults.contains(feature)) {

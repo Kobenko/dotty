@@ -3,7 +3,7 @@ package transform
 
 import core._
 import Symbols._, Types._, Contexts._, DenotTransformers._, Flags._
-import util.Positions._
+import util.Spans._
 import SymUtils._
 import StdNames._, NameOps._
 import Decorators._
@@ -18,23 +18,23 @@ class MixinOps(cls: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
     map(n => ctx.getClassIfDefined("org.junit." + n)).
     filter(_.exists)
 
-  def implementation(member: TermSymbol): TermSymbol = {
+  def mkForwarderSym(member: TermSymbol, extraFlags: FlagSet = EmptyFlags): TermSymbol = {
     val res = member.copy(
       owner = cls,
       name = member.name.stripScala2LocalSuffix,
-      flags = member.flags &~ Deferred,
+      flags = member.flags &~ Deferred | Synthetic | extraFlags,
       info = cls.thisType.memberInfo(member)).enteredAfter(thisPhase).asTerm
     res.addAnnotations(member.annotations.filter(_.symbol != defn.TailrecAnnot))
     res
   }
 
-  def superRef(target: Symbol, pos: Position = cls.pos): Tree = {
+  def superRef(target: Symbol, span: Span = cls.span): Tree = {
     val sup = if (target.isConstructor && !target.owner.is(Trait))
       Super(This(cls), tpnme.EMPTY, true)
     else
       Super(This(cls), target.owner.name.asTypeName, false, target.owner)
     //println(i"super ref $target on $sup")
-    ast.untpd.Select(sup.withPos(pos), target.name)
+    ast.untpd.Select(sup.withSpan(span), target.name)
       .withType(NamedType(sup.tpe, target))
     //sup.select(target)
   }
@@ -45,12 +45,6 @@ class MixinOps(cls: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
   def isCurrent(sym: Symbol): Boolean =
     ctx.atPhase(thisPhase) { implicit ctx =>
       cls.info.nonPrivateMember(sym.name).hasAltWith(_.symbol == sym)
-      // this is a hot spot, where we spend several seconds while compiling stdlib
-      // unfortunately it will discard and recompute all the member chaches,
-      // both making itself slow and slowing down anything that runs after it
-      // because resolveSuper uses hacks with explicit adding to scopes through .enter
-      // this cannot be fixed by a smarter caching strategy. With current implementation
-      // we HAVE to discard caches here for correctness
     }
 
   /** Does `method` need a forwarder to in  class `cls`
@@ -58,53 +52,42 @@ class MixinOps(cls: ClassSymbol, thisPhase: DenotTransformer)(implicit ctx: Cont
    *   - there's a class defining a method with same signature
    *   - there are multiple traits defining method with same signature
    */
-  def needsForwarder(meth: Symbol): Boolean = {
+  def needsMixinForwarder(meth: Symbol): Boolean = {
     lazy val competingMethods = competingMethodsIterator(meth).toList
 
     def needsDisambiguation = competingMethods.exists(x=> !(x is Deferred)) // multiple implementations are available
     def hasNonInterfaceDefinition = competingMethods.exists(!_.owner.is(Trait)) // there is a definition originating from class
+    !meth.isConstructor &&
     meth.is(Method, butNot = PrivateOrAccessorOrDeferred) &&
-    (meth.owner.is(Scala2x) || needsDisambiguation || hasNonInterfaceDefinition || needsJUnit4Fix(meth) ) &&
+    (ctx.settings.mixinForwarderChoices.isTruthy || meth.owner.is(Scala2x) || needsDisambiguation || hasNonInterfaceDefinition || needsJUnit4Fix(meth)) &&
     isCurrent(meth)
   }
 
   private def needsJUnit4Fix(meth: Symbol): Boolean = {
-    meth.annotations.nonEmpty && JUnit4Annotations.exists(annot => meth.hasAnnotation(annot))
-  }
-
-  /** Get `sym` of the method that needs a forwarder
-    *  Method needs a forwarder in those cases:
-    *   - there is a trait that defines a primitive version of implemented polymorphic method.
-    *   - there is a trait that defines a polymorphic version of implemented primitive method.
-    */
-  def needsPrimitiveForwarderTo(meth: Symbol): Option[Symbol] = {
-    def hasPrimitiveMissMatch(tp1: Type, tp2: Type): Boolean = (tp1, tp2) match {
-      case (tp1: MethodicType, tp2: MethodicType) =>
-        hasPrimitiveMissMatch(tp1.resultType, tp2.resultType) ||
-        tp1.paramInfoss.flatten.zip(tp1.paramInfoss.flatten).exists(args => hasPrimitiveMissMatch(args._1, args._2))
-      case _ =>
-        def isPrimitiveOrValueClass(sym: Symbol): Boolean = sym.isPrimitiveValueClass || sym.isValueClass
-        isPrimitiveOrValueClass(tp1.typeSymbol) ^ isPrimitiveOrValueClass(tp2.typeSymbol)
-    }
-
-    def needsPrimitiveForwarder(m: Symbol): Boolean =
-      m.owner != cls && !m.is(Deferred) && hasPrimitiveMissMatch(meth.info, m.info)
-
-    if (!meth.is(Method | Deferred, butNot = PrivateOrAccessor) || meth.overriddenSymbol(cls).exists || needsForwarder(meth)) None
-    else competingMethodsIterator(meth).find(needsPrimitiveForwarder)
+    meth.annotations.nonEmpty && JUnit4Annotations.exists(annot => meth.hasAnnotation(annot)) &&
+      ctx.settings.mixinForwarderChoices.isAtLeastJunit
   }
 
   final val PrivateOrAccessor: FlagSet = Private | Accessor
   final val PrivateOrAccessorOrDeferred: FlagSet = Private | Accessor | Deferred
 
-  def forwarder(target: Symbol): List[Type] => List[List[Tree]] => Tree =
-    targs => vrefss =>
-      superRef(target).appliedToTypes(targs).appliedToArgss(vrefss)
+  def forwarderRhsFn(target: Symbol): List[Type] => List[List[Tree]] => Tree =
+    targs => vrefss => {
+      val tapp = superRef(target).appliedToTypes(targs)
+      vrefss match {
+        case Nil | List(Nil) =>
+          // Overriding is somewhat loose about `()T` vs `=> T`, so just pick
+          // whichever makes sense for `target`
+          tapp.ensureApplied
+        case _ =>
+          tapp.appliedToArgss(vrefss)
+      }
+    }
 
   private def competingMethodsIterator(meth: Symbol): Iterator[Symbol] = {
     cls.baseClasses.iterator
       .filter(_ ne meth.owner)
-      .map(meth.overriddenSymbol)
+      .map(base => meth.overriddenSymbol(base, cls))
       .filter(_.exists)
   }
 }

@@ -106,7 +106,7 @@ object TypeApplications {
     private[this] var available = (0 until args.length).toSet
     var allReplaced: Boolean = true
     def hasWildcardArg(p: TypeParamRef): Boolean =
-      p.binder == tycon && args(p.paramNum).isInstanceOf[TypeBounds]
+      p.binder == tycon && isBounds(args(p.paramNum))
     def canReduceWildcard(p: TypeParamRef): Boolean =
       !ctx.mode.is(Mode.AllowLambdaWildcardApply) || available.contains(p.paramNum)
     def atNestedLevel(op: => Type): Type = {
@@ -129,6 +129,8 @@ object TypeApplications {
     def apply(t: Type): Type = t match {
       case t @ AppliedType(tycon, args1) if tycon.typeSymbol.isClass =>
         t.derivedAppliedType(apply(tycon), args1.mapConserve(applyArg))
+      case t @ RefinedType(parent, name, TypeAlias(info)) =>
+        t.derivedRefinedType(apply(parent), name, applyArg(info).bounds)
       case p: TypeParamRef if p.binder == tycon =>
         args(p.paramNum) match {
           case TypeBounds(lo, hi) =>
@@ -211,7 +213,10 @@ class TypeApplications(val self: Type) extends AnyVal {
 
   /** Is self type of kind "*"? */
   def hasSimpleKind(implicit ctx: Context): Boolean =
-    typeParams.isEmpty && !self.hasAnyKind
+    typeParams.isEmpty && !self.hasAnyKind || {
+      val alias = self.dealias
+      (alias ne self) && alias.hasSimpleKind
+    }
 
   /** If self type is higher-kinded, its result type, otherwise NoType.
    *  Note: The hkResult of an any-kinded type is again AnyKind.
@@ -356,7 +361,7 @@ class TypeApplications(val self: Type) extends AnyVal {
     else dealiased match {
       case dealiased: HKTypeLambda =>
         def tryReduce =
-          if (!args.exists(_.isInstanceOf[TypeBounds])) {
+          if (!args.exists(isBounds)) {
             val followAlias = Config.simplifyApplications && {
               dealiased.resType match {
                 case AppliedType(tyconBody, dealiasedArgs) =>
@@ -497,7 +502,7 @@ class TypeApplications(val self: Type) extends AnyVal {
   }
 
   /** The element type of a sequence or array */
-  def elemType(implicit ctx: Context): Type = self match {
+  def elemType(implicit ctx: Context): Type = self.widenDealias match {
     case defn.ArrayOf(elemtp) => elemtp
     case JavaArrayType(elemtp) => elemtp
     case _ => self.baseType(defn.SeqClass).argInfos.headOption.getOrElse(NoType)

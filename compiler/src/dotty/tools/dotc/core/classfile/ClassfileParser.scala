@@ -4,7 +4,7 @@ package core
 package classfile
 
 import Contexts._, Symbols._, Types._, Names._, StdNames._, NameOps._, Scopes._, Decorators._
-import SymDenotations._, unpickleScala2.Scala2Unpickler._, Constants._, Annotations._, util.Positions._
+import SymDenotations._, unpickleScala2.Scala2Unpickler._, Constants._, Annotations._, util.Spans._
 import NameKinds.DefaultGetterName
 import dotty.tools.dotc.core.tasty.{TastyHeaderUnpickler, TastyReader}
 import ast.tpd._
@@ -99,8 +99,6 @@ class ClassfileParser(
       throw new IOException(s"class file '${in.file}' has wrong magic number 0x${toHexString(magic)}, should be 0x${toHexString(JAVA_MAGIC)}")
     val minorVersion = in.nextChar.toInt
     val majorVersion = in.nextChar.toInt
-    if (majorVersion >= JAVA8_MAJOR_VERSION)
-      Scala2UnpicklingMode |= Mode.Java8Unpickling
     if ((majorVersion < JAVA_MAJOR_VERSION) ||
         ((majorVersion == JAVA_MAJOR_VERSION) &&
          (minorVersion < JAVA_MINOR_VERSION)))
@@ -139,11 +137,10 @@ class ClassfileParser(
       val ifaceCount = in.nextChar
       var ifaces = for (i <- (0 until ifaceCount).toList) yield pool.getSuperClass(in.nextChar).typeRef
         // Dotty deviation: was
-        //    var ifaces = for (i <- List.range(0 until ifaceCount)) ...
+        //    var ifaces = for (i <- List.range(0, ifaceCount)) ...
         // This does not typecheck because the type parameter of List is now lower-bounded by Int | Char.
         // Consequently, no best implicit for the "Integral" evidence parameter of "range"
-        // is found. If we treat constant subtyping specially, we might be able
-        // to do something there. But in any case, the until should be more efficient.
+        // is found. Previously, this worked because of weak conformance, which has been dropped.
 
       if (isAnnotation) ifaces = defn.ClassfileAnnotationType :: ifaces
       superType :: ifaces
@@ -168,13 +165,11 @@ class ClassfileParser(
       classInfo = parseAttributes(classRoot.symbol, classInfo)
       if (isAnnotation) addAnnotationConstructor(classInfo)
 
-      val companionClassMethod = ctx.synthesizeCompanionMethod(nme.COMPANION_CLASS_METHOD, classRoot, moduleRoot)
-      if (companionClassMethod.exists) companionClassMethod.entered
-      val companionModuleMethod = ctx.synthesizeCompanionMethod(nme.COMPANION_MODULE_METHOD, moduleRoot, classRoot)
-      if (companionModuleMethod.exists) companionModuleMethod.entered
+      classRoot.registerCompanion(moduleRoot.symbol)
+      moduleRoot.registerCompanion(classRoot.symbol)
 
-      setClassInfo(classRoot, classInfo)
-      setClassInfo(moduleRoot, staticInfo)
+      setClassInfo(classRoot, classInfo, fromScala2 = false)
+      setClassInfo(moduleRoot, staticInfo, fromScala2 = false)
     } else if (result == Some(NoEmbedded)) {
       for (sym <- List(moduleRoot.sourceModule, moduleRoot.symbol, classRoot.symbol)) {
         classRoot.owner.asClass.delete(sym)
@@ -365,7 +360,7 @@ class ClassfileParser(
             accept('.')
             val name = subName(c => c == ';' || c == '<' || c == '.').toTypeName
             val clazz = tpe.member(name).symbol
-            tpe = processClassType(processInner(clazz.typeRef))
+            tpe = processClassType(processInner(TypeRef(tpe, clazz)))
           }
           accept(';')
           tpe
@@ -663,7 +658,7 @@ class ClassfileParser(
           val constr = ctx.newSymbol(
             owner = classRoot.symbol,
             name = nme.CONSTRUCTOR,
-            flags = Flags.Synthetic | Flags.JavaDefined,
+            flags = Flags.Synthetic | Flags.JavaDefined | Flags.Method,
             info = constrType
           ).entered
           for ((attr, i) <- attrs.zipWithIndex)
@@ -808,7 +803,7 @@ class ClassfileParser(
               ctx.error("Could not load TASTY from .tasty for virtual file " + classfile)
               Array.empty
             case Some(jar: ZipArchive) => // We are in a jar
-              val cl = new URLClassLoader(Array(jar.jpath.toUri.toURL))
+              val cl = new URLClassLoader(Array(jar.jpath.toUri.toURL), /*parent =*/ null)
               val path = classfile.path.stripSuffix(".class") + ".tasty"
               val stream = cl.getResourceAsStream(path)
               if (stream != null) {

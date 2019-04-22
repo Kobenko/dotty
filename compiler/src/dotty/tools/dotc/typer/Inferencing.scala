@@ -8,10 +8,10 @@ import Contexts._, Types._, Flags._, Symbols._
 import Trees._
 import ProtoTypes._
 import NameKinds.UniqueName
-import util.Positions._
+import util.Spans._
 import util.{Stats, SimpleIdentityMap}
 import Decorators._
-import config.Printers.typr
+import config.Printers.{gadts, typr}
 import annotation.tailrec
 import reporting._
 import collection.mutable
@@ -38,14 +38,15 @@ object Inferencing {
   /** The fully defined type, where all type variables are forced.
    *  Throws an error if type contains wildcards.
    */
-  def fullyDefinedType(tp: Type, what: String, pos: Position)(implicit ctx: Context): Type =
+  def fullyDefinedType(tp: Type, what: String, span: Span)(implicit ctx: Context): Type =
     if (isFullyDefined(tp, ForceDegree.all)) tp
-    else throw new Error(i"internal error: type of $what $tp is not fully defined, pos = $pos") // !!! DEBUG
+    else throw new Error(i"internal error: type of $what $tp is not fully defined, pos = $span") // !!! DEBUG
 
 
   /** Instantiate selected type variables `tvars` in type `tp` */
   def instantiateSelected(tp: Type, tvars: List[Type])(implicit ctx: Context): Unit =
-    new IsFullyDefinedAccumulator(new ForceDegree.Value(tvars.contains, minimizeAll = true)).process(tp)
+    if (tvars.nonEmpty)
+      new IsFullyDefinedAccumulator(new ForceDegree.Value(tvars.contains, minimizeAll = true)).process(tp)
 
   /** Instantiate any type variables in `tp` whose bounds contain a reference to
    *  one of the parameters in `tparams` or `vparamss`.
@@ -78,8 +79,10 @@ object Inferencing {
    *      constrained upper bound != given upper bound and
    *      constrained lower bound == given lower bound).
    *  If (1) and (2) do not apply:
-   *   3. T is maximized if it appears only contravariantly in the given type.
-   *   4. T is minimized in all other cases.
+   *   3. T is minimized if forceDegree is minimizeAll.
+   *   4. Otherwise, T is maximized if it appears only contravariantly in the given type,
+   *      or if forceDegree is `noBottom` and T's minimized value is a bottom type.
+   *   5. Otherwise, T is minimized.
    *
    *  The instantiation is done in two phases:
    *  1st Phase: Try to instantiate minimizable type variables to
@@ -88,12 +91,15 @@ object Inferencing {
    *  to their upper bound.
    */
   private class IsFullyDefinedAccumulator(force: ForceDegree.Value)(implicit ctx: Context) extends TypeAccumulator[Boolean] {
+
     private def instantiate(tvar: TypeVar, fromBelow: Boolean): Type = {
       val inst = tvar.instantiate(fromBelow)
       typr.println(i"forced instantiation of ${tvar.origin} = $inst")
       inst
     }
+
     private[this] var toMaximize: Boolean = false
+
     def apply(x: Boolean, tp: Type): Boolean = tp.dealias match {
       case _: WildcardType | _: ProtoType =>
         false
@@ -101,19 +107,13 @@ object Inferencing {
       if !tvar.isInstantiated && ctx.typerState.constraint.contains(tvar) =>
         force.appliesTo(tvar) && {
           val direction = instDirection(tvar.origin)
-          if (direction != 0) {
-            //if (direction > 0) println(s"inst $tvar dir = up")
-            instantiate(tvar, direction < 0)
-          }
-          else {
-            val minimize =
-              force.minimizeAll ||
-              variance >= 0 && !(
-                !force.allowBottom &&
-                defn.isBottomType(ctx.typeComparer.approximation(tvar.origin, fromBelow = true)))
-            if (minimize) instantiate(tvar, fromBelow = true)
-            else toMaximize = true
-          }
+          def avoidBottom =
+            !force.allowBottom &&
+            defn.isBottomType(ctx.typeComparer.approximation(tvar.origin, fromBelow = true))
+          def preferMin = force.minimizeAll || variance >= 0 && !avoidBottom
+          if (direction != 0) instantiate(tvar, direction < 0)
+          else if (preferMin) instantiate(tvar, fromBelow = true)
+          else toMaximize = true
           foldOver(x, tvar)
         }
       case tp =>
@@ -144,11 +144,14 @@ object Inferencing {
       val (tl1, tvars) = constrained(tl, tree)
       var tree1 = AppliedTypeTree(tree.withType(tl1), tvars)
       tree1.tpe <:< pt
-      fullyDefinedType(tree1.tpe, "template parent", tree.pos)
+      fullyDefinedType(tree1.tpe, "template parent", tree.span)
       tree1
     case _ =>
       tree
   }
+
+  def isSkolemFree(tp: Type)(implicit ctx: Context): Boolean =
+    !tp.existsPart(_.isInstanceOf[SkolemType])
 
   /** Derive information about a pattern type by comparing it with some variant of the
    *  static scrutinee type. We have the following situation in case of a (dynamic) pattern match:
@@ -206,7 +209,9 @@ object Inferencing {
     }
 
     val widePt = if (ctx.scala2Mode || refinementIsInvariant(tp)) pt else widenVariantParams(pt)
-    tp <:< widePt
+    trace(i"constraining pattern type $tp <:< $widePt", gadts, res => s"$res\n${ctx.gadt.debugBoundsDescription}") {
+      tp <:< widePt
+    }
   }
 
   /** The list of uninstantiated type variables bound by some prefix of type `T` which
@@ -286,7 +291,7 @@ object Inferencing {
    *  @return   The list of type symbols that were created
    *            to instantiate undetermined type variables that occur non-variantly
    */
-  def maximizeType(tp: Type, pos: Position, fromScala2x: Boolean)(implicit ctx: Context): List[Symbol] = Stats.track("maximizeType") {
+  def maximizeType(tp: Type, span: Span, fromScala2x: Boolean)(implicit ctx: Context): List[Symbol] = Stats.track("maximizeType") {
     val vs = variances(tp)
     val patternBound = new mutable.ListBuffer[Symbol]
     vs foreachBinding { (tvar, v) =>
@@ -297,7 +302,7 @@ object Inferencing {
         if (bounds.hi <:< bounds.lo || bounds.hi.classSymbol.is(Final) || fromScala2x)
           tvar.instantiate(fromBelow = false)
         else {
-          val wildCard = ctx.newPatternBoundSymbol(UniqueName.fresh(tvar.origin.paramName), bounds, pos)
+          val wildCard = ctx.newPatternBoundSymbol(UniqueName.fresh(tvar.origin.paramName), bounds, span)
           tvar.instantiateWith(wildCard.typeRef)
           patternBound += wildCard
         }
@@ -400,59 +405,65 @@ trait Inferencing { this: Typer =>
    */
   def interpolateTypeVars(tree: Tree, pt: Type, locked: TypeVars)(implicit ctx: Context): tree.type = {
     val state = ctx.typerState
-    if (state.ownedVars.size > locked.size) {
-      val qualifying = state.ownedVars -- locked
-      typr.println(i"interpolate $tree: ${tree.tpe.widen} in $state, owned vars = ${state.ownedVars.toList}%, %, previous = ${locked.toList}%, % / ${state.constraint}")
-      val resultAlreadyConstrained =
-        tree.isInstanceOf[Apply] || tree.tpe.isInstanceOf[MethodOrPoly]
-      if (!resultAlreadyConstrained)
-        constrainResult(tree.symbol, tree.tpe, pt)
-          // This is needed because it could establish singleton type upper bounds. See i2998.scala.
 
-      val tp = tree.tpe.widen
-      val vs = variances(tp)
+    // Note that some variables in `locked` might not be in `state.ownedVars`
+    // anymore if they've been garbage-collected, so we can't use
+    // `state.ownedVars.size > locked.size` as an early check to avoid computing
+    // `qualifying`.
 
-      // Avoid interpolating variables occurring in tree's type if typerstate has unreported errors.
-      // Reason: The errors might reflect unsatisfiable constraints. In that
-      // case interpolating without taking account the constraints risks producing
-      // nonsensical types that then in turn produce incomprehensible errors.
-      // An example is in neg/i1240.scala. Without the condition in the next code line
-      // we get for
-      //
-      //      val y: List[List[String]] = List(List(1))
-      //
-      //     i1430.scala:5: error: type mismatch:
-      //     found   : Int(1)
-      //     required: Nothing
-      //     val y: List[List[String]] = List(List(1))
-      //                                           ^
-      // With the condition, we get the much more sensical:
-      //
-      //     i1430.scala:5: error: type mismatch:
-      //     found   : Int(1)
-      //     required: String
-      //     val y: List[List[String]] = List(List(1))
-      val hasUnreportedErrors = state.reporter match {
-        case r: StoreReporter if r.hasErrors => true
-        case _ => false
-      }
-      def constraint = state.constraint
-      for (tvar <- qualifying)
-        if (!tvar.isInstantiated && state.constraint.contains(tvar)) {
-          // Needs to be checked again, since previous interpolations could already have
-          // instantiated `tvar` through unification.
-          val v = vs(tvar)
-          if (v == null) {
-            typr.println(i"interpolate non-occurring $tvar in $state in $tree: $tp, fromBelow = ${tvar.hasLowerBound}, $constraint")
-            tvar.instantiate(fromBelow = tvar.hasLowerBound)
-          }
-          else if (!hasUnreportedErrors)
-            if (v.intValue != 0) {
-              typr.println(i"interpolate $tvar in $state in $tree: $tp, fromBelow = ${v.intValue == 1}, $constraint")
-              tvar.instantiate(fromBelow = v.intValue == 1)
+    val ownedVars = state.ownedVars
+    if ((ownedVars ne locked) && !ownedVars.isEmpty) {
+      val qualifying = ownedVars -- locked
+      if (!qualifying.isEmpty) {
+        typr.println(i"interpolate $tree: ${tree.tpe.widen} in $state, owned vars = ${state.ownedVars.toList}%, %, previous = ${locked.toList}%, % / ${state.constraint}")
+        val resultAlreadyConstrained =
+          tree.isInstanceOf[Apply] || tree.tpe.isInstanceOf[MethodOrPoly]
+        if (!resultAlreadyConstrained)
+          constrainResult(tree.symbol, tree.tpe, pt)
+            // This is needed because it could establish singleton type upper bounds. See i2998.scala.
+
+        val tp = tree.tpe.widen
+        val vs = variances(tp)
+
+        // Avoid interpolating variables occurring in tree's type if typerstate has unreported errors.
+        // Reason: The errors might reflect unsatisfiable constraints. In that
+        // case interpolating without taking account the constraints risks producing
+        // nonsensical types that then in turn produce incomprehensible errors.
+        // An example is in neg/i1240.scala. Without the condition in the next code line
+        // we get for
+        //
+        //      val y: List[List[String]] = List(List(1))
+        //
+        //     i1430.scala:5: error: type mismatch:
+        //     found   : Int(1)
+        //     required: Nothing
+        //     val y: List[List[String]] = List(List(1))
+        //                                           ^
+        // With the condition, we get the much more sensical:
+        //
+        //     i1430.scala:5: error: type mismatch:
+        //     found   : Int(1)
+        //     required: String
+        //     val y: List[List[String]] = List(List(1))
+        val hasUnreportedErrors = state.reporter.hasUnreportedErrors
+        def constraint = state.constraint
+        for (tvar <- qualifying)
+          if (!tvar.isInstantiated && state.constraint.contains(tvar)) {
+            // Needs to be checked again, since previous interpolations could already have
+            // instantiated `tvar` through unification.
+            val v = vs(tvar)
+            if (v == null) {
+              typr.println(i"interpolate non-occurring $tvar in $state in $tree: $tp, fromBelow = ${tvar.hasLowerBound}, $constraint")
+              tvar.instantiate(fromBelow = tvar.hasLowerBound)
             }
-            else typr.println(i"no interpolation for nonvariant $tvar in $state")
-        }
+            else if (!hasUnreportedErrors)
+              if (v.intValue != 0) {
+                typr.println(i"interpolate $tvar in $state in $tree: $tp, fromBelow = ${v.intValue == 1}, $constraint")
+                tvar.instantiate(fromBelow = v.intValue == 1)
+              }
+              else typr.println(i"no interpolation for nonvariant $tvar in $state")
+          }
+      }
     }
     tree
   }

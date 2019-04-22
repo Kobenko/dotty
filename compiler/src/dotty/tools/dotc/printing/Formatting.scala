@@ -28,10 +28,12 @@ object Formatting {
       case arg: Showable =>
         try arg.show
         catch {
+          case ex: CyclicReference => "... (caught cyclic reference) ..."
           case NonFatal(ex)
           if !ctx.mode.is(Mode.PrintShowExceptions) &&
              !ctx.settings.YshowPrintErrors.value =>
-            s"[cannot display due to $ex, raw string = ${arg.toString}]"
+            val msg = ex match { case te: TypeError => te.toMessage case _ => ex.getMessage }
+            s"[cannot display due to $msg, raw string = ${arg.toString}]"
         }
       case _ => arg.toString
     }
@@ -80,9 +82,8 @@ object Formatting {
           hl.show
         case hb: HighlightBuffer =>
           hb.toString
-        case str: String =>
-          SyntaxHighlighting.highlight(str)
-        case _ => super.showArg(arg)
+        case _ =>
+          SyntaxHighlighting.highlight(super.showArg(arg))
       }
   }
 
@@ -168,7 +169,7 @@ object Formatting {
         s"is a reference to a value parameter"
       case sym: Symbol =>
         val info =
-          if (ctx.gadt.bounds.contains(sym))
+          if (ctx.gadt.contains(sym))
             sym.info & ctx.gadt.bounds(sym)
           else
             sym.info
@@ -189,7 +190,7 @@ object Formatting {
       case param: TermParamRef => false
       case skolem: SkolemType => true
       case sym: Symbol =>
-        ctx.gadt.bounds.contains(sym) && ctx.gadt.bounds(sym) != TypeBounds.empty
+        ctx.gadt.contains(sym) && ctx.gadt.bounds(sym) != TypeBounds.empty
       case _ =>
         assert(false, "unreachable")
         false

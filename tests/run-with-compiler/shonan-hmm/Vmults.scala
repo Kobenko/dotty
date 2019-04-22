@@ -1,5 +1,3 @@
-
-import scala.quoted.Toolbox.Default._
 import scala.quoted._
 
 class Vmult[Idx, T, Unt](tring: Ring[T], vec: VecOp[Idx, Unt]) {
@@ -24,10 +22,10 @@ object Vmults {
   def vmultCA: Expr[(Array[Complex[Int]], Array[Complex[Int]], Array[Complex[Int]]) => Unit] = '{
     (vout, v1, v2) => {
       val n = vout.length
-      ~{
-        val vout_ = OVec[Expr[Int], Complex[Expr[Int]], Expr[Unit]]('(n), (i, v) => '(vout(~i) = ~Complex.of_expr_complex(v)))
-        val v1_ = Vec ('(n), i => Complex.of_complex_expr('(v1(~i))))
-        val v2_ = Vec ('(n), i => Complex.of_complex_expr('(v2(~i))))
+      ${
+        val vout_ = OVec[Expr[Int], Complex[Expr[Int]], Expr[Unit]]('n, (i, v) => '{vout($i) = ${Complex.of_expr_complex(v)}})
+        val v1_ = Vec ('n, i => Complex.of_complex_expr('{v1($i)}))
+        val v2_ = Vec ('n, i => Complex.of_complex_expr('{v2($i)}))
 
         val V = new Vmult[Expr[Int], Complex[Expr[Int]], Expr[Unit]](RingComplex(RingIntExpr), new VecDyn)
         V.vmult(vout_, v1_, v2_)

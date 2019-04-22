@@ -26,7 +26,7 @@ private[repl] class Rendering(parentClassLoader: Option[ClassLoader] = None) {
   private[this] var myClassLoader: ClassLoader = _
 
   /** Class loader used to load compiled code */
-  private[this] def classLoader()(implicit ctx: Context) =
+  private[repl] def classLoader()(implicit ctx: Context) =
     if (myClassLoader != null) myClassLoader
     else {
       val parent = parentClassLoader.getOrElse {
@@ -76,11 +76,8 @@ private[repl] class Rendering(parentClassLoader: Option[ClassLoader] = None) {
     val dcl = d.symbol.showUser
 
     try {
-      val resultValue =
-        if (d.symbol.is(Flags.Lazy)) Some("<lazy>")
-        else valueOf(d.symbol)
-
-      resultValue.map(value => s"$dcl = $value")
+      if (d.symbol.is(Flags.Lazy)) Some(dcl)
+      else valueOf(d.symbol).map(value => s"$dcl = $value")
     }
     catch { case ex: InvocationTargetException => Some(renderError(ex)) }
   }

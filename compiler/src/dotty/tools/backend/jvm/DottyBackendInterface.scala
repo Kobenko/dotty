@@ -3,7 +3,7 @@ package dotty.tools.backend.jvm
 import dotty.tools.dotc.ast.tpd
 import dotty.tools.dotc.ast.Trees
 import dotty.tools.dotc
-import dotty.tools.dotc.core.Flags.FlagSet
+import dotty.tools.dotc.core.Flags.{termFlagSet, termFlagConjunction}
 import dotty.tools.dotc.transform.{Erasure, GenericSignatures}
 import dotty.tools.dotc.transform.SymUtils._
 import java.io.{File => _}
@@ -11,17 +11,17 @@ import java.io.{File => _}
 import scala.collection.generic.Clearable
 import scala.collection.mutable
 import scala.reflect.ClassTag
-import scala.reflect.internal.util.WeakHashSet
+import dotty.tools.dotc.util.WeakHashSet
 import dotty.tools.io.AbstractFile
 import scala.tools.asm.AnnotationVisitor
-import scala.tools.nsc.backend.jvm.{BCodeHelpers, BackendInterface}
 import dotty.tools.dotc.core._
 import Contexts._
 import Types._
 import Symbols._
 import Phases._
 
-import dotty.tools.dotc.util.Positions
+import dotty.tools.dotc.util
+import dotty.tools.dotc.util.Spans
 import Decorators._
 import tpd._
 
@@ -41,7 +41,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
   type CompilationUnit = dotc.CompilationUnit
   type Constant        = Constants.Constant
   type Literal         = tpd.Literal
-  type Position        = Positions.Position
+  type Position        = Spans.Span
   type Name            = Names.Name
   type ClassDef        = tpd.TypeDef
   type TypeDef         = tpd.TypeDef
@@ -77,7 +77,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
   type Closure         = tpd.Closure
 
   val NoSymbol: Symbol = Symbols.NoSymbol
-  val NoPosition: Position = Positions.NoPosition
+  val NoPosition: Position = Spans.NoSpan
   val EmptyTree: Tree = tpd.EmptyTree
 
 
@@ -254,7 +254,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
         }
       case t: TypeApply if (t.fun.symbol == Predef_classOf) =>
         av.visit(name, t.args.head.tpe.classSymbol.denot.info.toTypeKind(bcodeStore)(innerClasesStore).toASMType)
-      case t: tpd.Select =>
+      case t: tpd.RefTree =>
         if (t.symbol.denot.owner.is(Flags.JavaEnum)) {
           val edesc = innerClasesStore.typeDescriptor(t.tpe.asInstanceOf[bcodeStore.int.Type]) // the class descriptor of the enumeration class.
           val evalue = t.symbol.name.mangledString // value the actual enumeration value.
@@ -380,16 +380,17 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     ctx.requiredModule(className)
   }
 
-
   def debuglog(msg: => String): Unit = ctx.debuglog(msg)
   def informProgress(msg: String): Unit = ctx.informProgress(msg)
   def log(msg: => String): Unit = ctx.log(msg)
-  def error(pos: Position, msg: String): Unit = ctx.error(msg, pos)
-  def warning(pos: Position, msg: String): Unit = ctx.warning(msg, pos)
+  def error(pos: Position, msg: String): Unit = ctx.error(msg, sourcePos(pos))
+  def warning(pos: Position, msg: String): Unit = ctx.warning(msg, sourcePos(pos))
   def abort(msg: String): Nothing = {
     ctx.error(msg)
     throw new RuntimeException(msg)
   }
+  def sourcePos(pos: Position)(implicit ctx: Context): util.SourcePosition =
+    ctx.source.atSpan(pos)
 
   def emitAsmp: Option[String] = None
 
@@ -430,7 +431,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
   val Flag_METHOD: Flags = Flags.Method.bits
   val ExcludedForwarderFlags: Flags = {
       Flags.Specialized | Flags.Lifted | Flags.Protected | Flags.JavaStatic |
-      Flags.Bridge | Flags.Private | Flags.Macro
+      Flags.Private | Flags.Macro
   }.bits
 
   def isQualifierSafeToElide(qual: Tree): Boolean = tpd.isIdempotentExpr(qual)
@@ -475,7 +476,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     // unrelated change.
        ctx.base.settings.YnoGenericSig.value
     || sym.is(Flags.Artifact)
-    || sym.is(Flags.allOf(Flags.Method, Flags.Lifted))
+    || sym.is(Flags.LiftedMethod)
     || sym.is(Flags.Bridge)
   )
 
@@ -502,7 +503,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
         i"""|compiler bug: created invalid generic signature for $sym in ${sym.denot.owner.showFullName}
             |signature: $sig
             |if this is reproducible, please report bug at https://github.com/lampepfl/dotty/issues
-        """.trim, sym.pos)
+        """.trim, sym.sourcePos)
     }
   }
 
@@ -587,7 +588,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
   implicit def treeHelper(a: Tree): TreeHelper = new TreeHelper {
     def symbol: Symbol = a.symbol
 
-    def pos: Position = a.pos
+    def pos: Position = a.span
 
     def isEmpty: Boolean = a.isEmpty
 
@@ -665,7 +666,6 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     def isStrictFP: Boolean = false // todo: implement
     def isLabel: Boolean = sym is Flags.Label
     def hasPackageFlag: Boolean = sym is Flags.Package
-    def isImplClass: Boolean = sym is Flags.ImplClass
     def isInterface: Boolean = (sym is Flags.PureInterface) || (sym is Flags.Trait)
     def isGetter: Boolean = toDenot(sym).isGetter
     def isSetter: Boolean = toDenot(sym).isSetter
@@ -682,7 +682,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
 
     def isFinal: Boolean = sym is Flags.Final
     def isStaticMember: Boolean = (sym ne NoSymbol) &&
-      ((sym is Flags.JavaStatic) || (owner is Flags.ImplClass) || toDenot(sym).hasAnnotation(ctx.definitions.ScalaStaticAnnot))
+      ((sym is Flags.JavaStatic) || toDenot(sym).hasAnnotation(ctx.definitions.ScalaStaticAnnot))
       // guard against no sumbol cause this code is executed to select which call type(static\dynamic) to use to call array.clone
 
     def isBottomClass: Boolean = (sym ne defn.NullClass) && (sym ne defn.NothingClass)
@@ -700,10 +700,11 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     def isNonBottomSubClass(other: Symbol): Boolean = sym.derivesFrom(other)
     def hasAnnotation(ann: Symbol): Boolean = toDenot(sym).hasAnnotation(ann)
     def shouldEmitForwarders: Boolean =
-      (sym is Flags.Module) && !(sym is Flags.ImplClass) && sym.isStatic
+      (sym is Flags.Module) && sym.isStatic
     def isJavaEntryPoint: Boolean = CollectEntryPoints.isJavaEntryPoint(sym)
 
     def isClassConstructor: Boolean = toDenot(sym).isClassConstructor
+    def isSerializable: Boolean = toDenot(sym).isSerializable
 
     /**
      * True for module classes of modules that are top-level or owned only by objects. Module classes
@@ -764,6 +765,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
       }
       else sym.enclosingClass(ctx.withPhase(ctx.flattenPhase.prev))
     } //todo is handled specially for JavaDefined symbols in scalac
+    def nextOverriddenSymbol: Symbol = toDenot(sym).nextOverriddenSymbol
 
     // members
     def primaryConstructor: Symbol = toDenot(sym).primaryConstructor
@@ -801,7 +803,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
 
 
     def freshLocal(cunit: CompilationUnit, name: String, tpe: Type, pos: Position, flags: Flags): Symbol = {
-      ctx.newSymbol(sym, name.toTermName, FlagSet(flags), tpe, NoSymbol, pos)
+      ctx.newSymbol(sym, name.toTermName, termFlagSet(flags), tpe, NoSymbol, pos)
     }
 
     def getter(clz: Symbol): Symbol = decorateSymbol(sym).getter
@@ -809,7 +811,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
 
     def moduleSuffix: String = "" // todo: validate that names already have $ suffix
     def outputDirectory: AbstractFile = DottyBackendInterface.this.outputDirectory
-    def pos: Position = sym.pos
+    def pos: Position = sym.span
 
     def throwsAnnotations: List[Symbol] = Nil
 
@@ -837,22 +839,19 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
         toDenot(sym).owner.is(Flags.PackageClass)
       }
 
-    /**
-     * This is basically a re-implementation of sym.isStaticOwner, but using the originalOwner chain.
-     *
-     * The problem is that we are interested in a source-level property. Various phases changed the
-     * symbol's properties in the meantime, mostly lambdalift modified (destructively) the owner.
-     * Therefore, `sym.isStatic` is not what we want. For example, in
-     *   object T { def f { object U } }
-     * the owner of U is T, so UModuleClass.isStatic is true. Phase travel does not help here.
-     */
-    def isOriginallyStaticOwner: Boolean = sym.isStatic
-
-
     def addRemoteRemoteExceptionAnnotation: Unit = ()
 
-    def samMethod(): Symbol =
-      toDenot(sym).info.abstractTermMembers.headOption.getOrElse(toDenot(sym).info.member(nme.apply)).symbol
+    def samMethod(): Symbol = ctx.atPhase(ctx.erasurePhase) { implicit ctx =>
+      toDenot(sym).info.abstractTermMembers.toList match {
+        case x :: Nil => x.symbol
+        case Nil => abort(s"${sym.show} is not a functional interface. It doesn't have abstract methods")
+        case xs => abort(s"${sym.show} is not a functional interface. " +
+          s"It has the following abstract methods: ${xs.map(_.name).mkString(", ")}")
+      }
+    }
+
+    def isFunctionClass: Boolean =
+      defn.isFunctionClass(sym)
   }
 
 
@@ -881,7 +880,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     def =:=(other: Type): Boolean = tp =:= other
 
     def membersBasedOnFlags(excludedFlags: Flags, requiredFlags: Flags): List[Symbol] =
-      tp.membersBasedOnFlags(FlagSet(requiredFlags), FlagSet(excludedFlags)).map(_.symbol).toList
+      tp.membersBasedOnFlags(termFlagConjunction(requiredFlags), termFlagSet(excludedFlags)).map(_.symbol).toList
 
     def resultType: Type = tp.resultType
 
@@ -1105,7 +1104,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
     def _1: Type = field.tpe match {
       case JavaArrayType(elem) => elem
       case _ =>
-        ctx.error(s"JavaSeqArray with type ${field.tpe} reached backend: $field", field.pos)
+        error(field.span, s"JavaSeqArray with type ${field.tpe} reached backend: $field")
         UnspecifiedErrorType
     }
     def _2: List[Tree] = field.elems
@@ -1172,9 +1171,9 @@ class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Ma
       else {
         val arity = field.meth.tpe.widenDealias.paramTypes.size - _1.size
         val returnsUnit = field.meth.tpe.widenDealias.resultType.classSymbol == UnitClass
-        if (returnsUnit)
-          ctx.requiredClass(("scala.compat.java8.JProcedure" + arity))
-        else ctx.requiredClass(("scala.compat.java8.JFunction" + arity))
+        if (returnsUnit) ctx.requiredClass(("dotty.runtime.function.JProcedure" + arity))
+        else if (arity <= 2) ctx.requiredClass(("dotty.runtime.function.JFunction" + arity))
+        else ctx.requiredClass(("scala.Function" + arity))
       }
     }
   }

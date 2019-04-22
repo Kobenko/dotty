@@ -5,7 +5,7 @@ import scala.annotation.implicitNotFound
 
 sealed trait HList
 sealed trait HNil extends HList
-final case object HNil extends HNil
+case object HNil extends HNil
 final case class ::[H, T <: HList](h: H, t: T) extends HList
 
 /** Generic representation os type T as a labelled sum of product. */
@@ -26,7 +26,7 @@ trait Dataset[T] {
   // Use c.label to do an untyped select on actual Spark Dataset, and
   // cast the result to TypedDataset[A]
 
-  def col[S <: String, A](s: S)(implicit erased ev: Exists[T, s.type, A]) =
+  def col[S <: String, A](s: S) given erased (ev: Exists[T, s.type, A]) =
     new Column[T, A](s) // ev is only here to check than this is safe, it's never used at runtime!
 
   def collect(): Vector[T]

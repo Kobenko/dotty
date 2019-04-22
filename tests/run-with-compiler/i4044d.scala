@@ -1,15 +1,15 @@
 import scala.quoted._
-import scala.quoted.Toolbox.Default._
 
 class Foo {
   def foo: Unit = {
-    val a: Expr[Int] = '(3)
+    implicit val toolbox: scala.quoted.Toolbox = scala.quoted.Toolbox.make(getClass.getClassLoader)
+    val a: Expr[Int] = '{3}
     val q: Expr[Int] = '{
       val b = 3
-      ~{
+      ${
         println("evaluating inner quote")
         '{
-          b + ~a
+          b + $a
         }
       }
     }

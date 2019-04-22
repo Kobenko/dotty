@@ -90,7 +90,7 @@ class TreeChecker extends Phase with SymTransformer {
   def run(implicit ctx: Context): Unit = {
     if (ctx.settings.YtestPickler.value && ctx.phase.prev.isInstanceOf[Pickler])
       ctx.echo("Skipping Ycheck after pickling with -Ytest-pickler, the returned tree contains stale symbols")
-    else
+    else if (ctx.phase.prev.isCheckable)
       check(ctx.base.allPhases, ctx)
   }
 
@@ -180,7 +180,7 @@ class TreeChecker extends Phase with SymTransformer {
 
     def assertDefined(tree: untpd.Tree)(implicit ctx: Context): Unit =
       if (tree.symbol.maybeOwner.isTerm)
-        assert(nowDefinedSyms contains tree.symbol, i"undefined symbol ${tree.symbol} at line " + tree.pos.line)
+        assert(nowDefinedSyms contains tree.symbol, i"undefined symbol ${tree.symbol} at line " + tree.sourcePos.line)
 
     /** assert Java classes are not used as objects */
     def assertIdentNotJavaClass(tree: Tree)(implicit ctx: Context): Unit = tree match {
@@ -233,8 +233,6 @@ class TreeChecker extends Phase with SymTransformer {
         elems.foreach(assertIdentNotJavaClass)
       // case tree: TypeTree =>
       // case tree: SingletonTypeTree =>
-      // case tree: AndTypeTree =>
-      // case tree: OrTypeTree =>
       // case tree: RefinedTypeTree =>
       // case tree: AppliedTypeTree =>
       // case tree: ByNameTypeTree =>
@@ -370,7 +368,6 @@ class TreeChecker extends Phase with SymTransformer {
 
       def isNonMagicalMethod(x: Symbol) =
         x.is(Method) &&
-          !x.isCompanionMethod &&
           !x.isValueClassConvertMethod &&
           !(x.is(Macro) && ctx.phase.refChecked) &&
           !x.name.is(DocArtifactName)
@@ -460,8 +457,7 @@ class TreeChecker extends Phase with SymTransformer {
       if (ctx.mode.isExpr &&
           !tree.isEmpty &&
           !isPrimaryConstructorReturn &&
-          !pt.isInstanceOf[FunProto] &&
-          !pt.isInstanceOf[PolyProto])
+          !pt.isInstanceOf[FunOrPolyProto])
         assert(tree.tpe <:< pt, {
           val mismatch = err.typeMismatchMsg(tree.tpe, pt)
           i"""|${mismatch.msg}

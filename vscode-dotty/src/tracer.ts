@@ -84,17 +84,15 @@ export class Tracer {
 
     run(): vscode.OutputChannel | undefined {
         const consentCommandDisposable = vscode.commands.registerCommand(consentCommandName, () => this.askForTracingConsent())
-        if (this.isTracingEnabled) {
-            if (this.tracingConsent.get() === 'no-answer') this.askForTracingConsent()
-            this.initializeAsyncWorkspaceDump()
+        if (this.isTracingEnabled && this.tracingConsent.get() === 'no-answer') this.askForTracingConsent()
+        this.initializeAsyncWorkspaceDump()
 
-            const lspOutputChannel = this.createLspOutputChannel()
-            const statusBarItem = this.createStatusBarItem()
-            for (const disposable of [consentCommandDisposable, lspOutputChannel, statusBarItem]) {
-                if (disposable) this.ctx.extensionContext.subscriptions.push(disposable)
-            }
-            return lspOutputChannel
+        const lspOutputChannel = this.createLspOutputChannel()
+        const statusBarItem = this.createStatusBarItem()
+        for (const disposable of [consentCommandDisposable, lspOutputChannel, statusBarItem]) {
+            if (disposable) this.ctx.extensionContext.subscriptions.push(disposable)
         }
+        return lspOutputChannel
     }
 
     private askForTracingConsent(): void {
@@ -103,15 +101,17 @@ export class Tracer {
             'the content of every Scala file in your project and ' +
             'every interaction with Scala files in the IDE, including keystrokes. ' +
             'This data will be stored anonymously (we won\'t know your name) on servers at EPFL in Switzerland.',
-            'Allow', 'Deny',
-        ).then((value: string | undefined) => {
-            if (value === 'Allow' || value === 'Deny') this.tracingConsent.set(value)
+            { 'modal': true },
+            { title: 'Allow' },
+            { title: 'Deny', isCloseAffordance: true }
+        ).then(value => {
+            if (value !== undefined && (value.title === 'Allow' || value.title === 'Deny')) this.tracingConsent.set(value.title)
         })
     }
 
     private initializeAsyncWorkspaceDump() {
         const url = this.remoteWorkspaceDumpUrl
-        if (url === undefined) return
+        if (!url) return
 
         const doInitialize = () => {
             try {

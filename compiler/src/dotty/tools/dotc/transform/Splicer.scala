@@ -11,8 +11,7 @@ import dotty.tools.dotc.core.Decorators._
 import dotty.tools.dotc.core.Flags._
 import dotty.tools.dotc.core.NameKinds.FlatName
 import dotty.tools.dotc.core.Names.{Name, TermName}
-import dotty.tools.dotc.core.StdNames.nme
-import dotty.tools.dotc.core.StdNames.str.MODULE_INSTANCE_FIELD
+import dotty.tools.dotc.core.StdNames._
 import dotty.tools.dotc.core.quoted._
 import dotty.tools.dotc.core.Types._
 import dotty.tools.dotc.core.Symbols._
@@ -22,6 +21,7 @@ import dotty.tools.dotc.tastyreflect.ReflectionImpl
 
 import scala.util.control.NonFatal
 import dotty.tools.dotc.util.SourcePosition
+import dotty.tools.repl.AbstractFileClassLoader
 
 import scala.reflect.ClassTag
 
@@ -29,8 +29,8 @@ import scala.reflect.ClassTag
 object Splicer {
   import tpd._
 
-  /** Splice the Tree for a Quoted expression. `~'(xyz)` becomes `xyz`
-   *  and for `~xyz` the tree of `xyz` is interpreted for which the
+  /** Splice the Tree for a Quoted expression. `${'{xyz}}` becomes `xyz`
+   *  and for `$xyz` the tree of `xyz` is interpreted for which the
    *  resulting expression is returned as a `Tree`
    *
    *  See: `Staging`
@@ -41,12 +41,19 @@ object Splicer {
       val interpreter = new Interpreter(pos, classLoader)
       try {
         // Some parts of the macro are evaluated during the unpickling performed in quotedExprToTree
-        val interpreted = interpreter.interpret[scala.quoted.Expr[Any]](tree)
-        interpreted.fold(tree)(x => PickledQuotes.quotedExprToTree(x))
+        val interpretedExpr = interpreter.interpret[scala.quoted.Expr[Any]](tree)
+        interpretedExpr.fold(tree)(x => PickledQuotes.quotedExprToTree(x))
       }
       catch {
         case ex: scala.quoted.QuoteError =>
-          ctx.error(ex.getMessage, pos)
+          val pos1 = ex.from match {
+            case None => pos
+            case Some(expr) =>
+              val reflect: scala.tasty.Reflection = ReflectionImpl(ctx)
+              import reflect._
+              expr.unseal.underlyingArgument.pos.asInstanceOf[SourcePosition]
+          }
+          ctx.error(ex.getMessage, pos1)
           EmptyTree
         case NonFatal(ex) =>
           val msg =
@@ -59,8 +66,8 @@ object Splicer {
       }
   }
 
-  /** Check that the Tree can be spliced. `~'(xyz)` becomes `xyz`
-    *  and for `~xyz` the tree of `xyz` is interpreted for which the
+  /** Check that the Tree can be spliced. `${'{xyz}}` becomes `xyz`
+    *  and for `$xyz` the tree of `xyz` is interpreted for which the
     *  resulting expression is returned as a `Tree`
     *
     *  See: `Staging`
@@ -95,7 +102,7 @@ object Splicer {
     }
 
     protected def interpretQuote(tree: Tree)(implicit env: Env): Object =
-      new scala.quoted.Exprs.TastyTreeExpr(tree)
+      new scala.quoted.Exprs.TastyTreeExpr(Inlined(EmptyTree, Nil, tree).withSpan(tree.span))
 
     protected def interpretTypeQuote(tree: Tree)(implicit env: Env): Object =
       new scala.quoted.Types.TreeType(tree)
@@ -106,22 +113,26 @@ object Splicer {
     protected def interpretVarargs(args: List[Object])(implicit env: Env): Object =
       args.toSeq
 
-    protected def interpretTastyContext()(implicit env: Env): Object = {
-      new ReflectionImpl(ctx) {
-        override def rootPosition: SourcePosition = pos
-      }
-    }
+    protected def interpretTastyContext()(implicit env: Env): Object = ReflectionImpl(ctx, pos)
 
-    protected def interpretStaticMethodCall(fn: Symbol, args: => List[Object])(implicit env: Env): Object = {
-      val instance = loadModule(fn.owner)
+    protected def interpretStaticMethodCall(moduleClass: Symbol, fn: Symbol, args: => List[Object])(implicit env: Env): Object = {
+      val (inst, clazz) =
+        if (moduleClass.name.startsWith(str.REPL_SESSION_LINE)) {
+          (null, loadReplLineClass(moduleClass))
+        } else {
+          val inst = loadModule(moduleClass)
+          (inst, inst.getClass)
+        }
+
       def getDirectName(tp: Type, name: TermName): TermName = tp.widenDealias match {
         case tp: AppliedType if defn.isImplicitFunctionType(tp) =>
           getDirectName(tp.args.last, NameKinds.DirectMethodName(name))
         case _ => name
       }
+
       val name = getDirectName(fn.info.finalResultType, fn.name.asTermName)
-      val method = getMethod(instance.getClass, name, paramsSig(fn))
-      stopIfRuntimeException(method.invoke(instance, args: _*))
+      val method = getMethod(clazz, name, paramsSig(fn))
+      stopIfRuntimeException(method.invoke(inst, args: _*))
     }
 
     protected def interpretModuleAccess(fn: Symbol)(implicit env: Env): Object =
@@ -134,18 +145,23 @@ object Splicer {
     }
 
     protected def unexpectedTree(tree: Tree)(implicit env: Env): Object =
-      throw new StopInterpretation("Unexpected tree could not be interpreted: " + tree, tree.pos)
+      throw new StopInterpretation("Unexpected tree could not be interpreted: " + tree, tree.sourcePos)
 
     private def loadModule(sym: Symbol): Object = {
       if (sym.owner.is(Package)) {
         // is top level object
         val moduleClass = loadClass(sym.fullName)
-        moduleClass.getField(MODULE_INSTANCE_FIELD).get(null)
+        moduleClass.getField(str.MODULE_INSTANCE_FIELD).get(null)
       } else {
         // nested object in an object
         val clazz = loadClass(sym.fullNameSeparated(FlatName))
         clazz.getConstructor().newInstance().asInstanceOf[Object]
       }
+    }
+
+    private def loadReplLineClass(moduleClass: Symbol)(implicit env: Env): Class[_] = {
+      val lineClassloader = new AbstractFileClassLoader(ctx.settings.outputDir.value, classLoader)
+      lineClassloader.loadClass(moduleClass.name.firstPart.toString)
     }
 
     private def loadClass(name: Name): Class[_] = {
@@ -270,7 +286,7 @@ object Splicer {
     protected def interpretVarargs(args: List[Boolean])(implicit env: Env): Boolean = args.forall(identity)
     protected def interpretTastyContext()(implicit env: Env): Boolean = true
     protected def interpretQuoteContext()(implicit env: Env): Boolean = true
-    protected def interpretStaticMethodCall(fn: Symbol, args: => List[Boolean])(implicit env: Env): Boolean = args.forall(identity)
+    protected def interpretStaticMethodCall(module: Symbol, fn: Symbol, args: => List[Boolean])(implicit env: Env): Boolean = args.forall(identity)
     protected def interpretModuleAccess(fn: Symbol)(implicit env: Env): Boolean = true
     protected def interpretNew(fn: Symbol, args: => List[Boolean])(implicit env: Env): Boolean = args.forall(identity)
 
@@ -292,16 +308,23 @@ object Splicer {
     protected def interpretLiteral(value: Any)(implicit env: Env): Result
     protected def interpretVarargs(args: List[Result])(implicit env: Env): Result
     protected def interpretTastyContext()(implicit env: Env): Result
-    protected def interpretStaticMethodCall(fn: Symbol, args: => List[Result])(implicit env: Env): Result
+    protected def interpretStaticMethodCall(module: Symbol, fn: Symbol, args: => List[Result])(implicit env: Env): Result
     protected def interpretModuleAccess(fn: Symbol)(implicit env: Env): Result
     protected def interpretNew(fn: Symbol, args: => List[Result])(implicit env: Env): Result
     protected def unexpectedTree(tree: Tree)(implicit env: Env): Result
 
     protected final def interpretTree(tree: Tree)(implicit env: Env): Result = tree match {
-      case Apply(TypeApply(fn, _), quoted :: Nil) if fn.symbol == defn.QuotedExpr_apply =>
-        interpretQuote(quoted)
+      case Apply(TypeApply(fn, _), quoted :: Nil) if fn.symbol == defn.InternalQuoted_exprQuote =>
+        val quoted1 = quoted match {
+          case quoted: Ident if quoted.symbol.is(InlineByNameProxy) =>
+            // inline proxy for by-name parameter
+            quoted.symbol.defTree.asInstanceOf[DefDef].rhs
+          case Inlined(EmptyTree, _, quoted) => quoted
+          case _ => quoted
+        }
+        interpretQuote(quoted1)
 
-      case TypeApply(fn, quoted :: Nil) if fn.symbol == defn.QuotedType_apply =>
+      case TypeApply(fn, quoted :: Nil) if fn.symbol == defn.InternalQuoted_typeQuote =>
         interpretTypeQuote(quoted)
 
       case Literal(Constant(value)) =>
@@ -313,11 +336,18 @@ object Splicer {
       case Call(fn, args) =>
         if (fn.symbol.isConstructor && fn.symbol.owner.owner.is(Package)) {
           interpretNew(fn.symbol, args.map(interpretTree))
+        } else if (fn.symbol.is(Module)) {
+          interpretModuleAccess(fn.symbol)
         } else if (fn.symbol.isStatic) {
-          if (fn.symbol.is(Module)) interpretModuleAccess(fn.symbol)
-          else interpretStaticMethodCall(fn.symbol, args.map(arg => interpretTree(arg)))
+          val module = fn.symbol.owner
+          interpretStaticMethodCall(module, fn.symbol, args.map(arg => interpretTree(arg)))
+        } else if (fn.qualifier.symbol.is(Module) && fn.qualifier.symbol.isStatic) {
+          val module = fn.qualifier.symbol.moduleClass
+          interpretStaticMethodCall(module, fn.symbol, args.map(arg => interpretTree(arg)))
         } else if (env.contains(fn.name)) {
           env(fn.name)
+        } else if (tree.symbol.is(InlineProxy)) {
+          interpretTree(tree.symbol.defTree.asInstanceOf[ValOrDefDef].rhs)
         } else {
           unexpectedTree(tree)
         }
@@ -333,7 +363,7 @@ object Splicer {
         interpretTree(expr)(newEnv)
       case NamedArg(_, arg) => interpretTree(arg)
 
-      case Inlined(EmptyTree, Nil, expansion) => interpretTree(expansion)
+      case Inlined(_, Nil, expansion) => interpretTree(expansion)
 
       case Typed(expr, _) =>
         interpretTree(expr)

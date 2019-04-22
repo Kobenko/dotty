@@ -2,7 +2,7 @@
   "name": "dotty",
   "displayName": "Dotty Language Server",
   "description": "IDE integration for Dotty, the experimental Scala compiler",
-  "version": "0.1.10-snapshot",
+  "version": "0.1.15-snapshot",
   "license": "BSD-3-Clause",
   "publisher": "lampepfl",
   "repository": {
@@ -11,10 +11,10 @@
   },
   "icon": "images/dotty-logo.png",
   "engines": {
-    "vscode": "^1.27.1"
+    "vscode": "^1.30.0"
   },
   "categories": [
-    "Languages"
+    "Programming Languages"
   ],
   "keywords": [
     "scala",
@@ -37,6 +37,15 @@
         ],
         "aliases": [
           "Scala"
+        ]
+      },
+      {
+        "id": "tasty",
+        "extensions": [
+          ".tasty"
+        ],
+        "aliases": [
+          "TASTy"
         ]
       }
     ],
@@ -107,23 +116,23 @@
     "scala-lang.scala"
   ],
   "dependencies": {
-    "promisify-child-process": "^2.1.2",
-    "compare-versions": "^3.4.0",
-    "vscode-languageclient": "^5.1.0",
-    "vscode-languageserver": "^5.1.0",
-    "vscode-jsonrpc": "4.0.0",
-    "ws": "^6.0.0",
     "archiver": "^3.0.0",
-    "request": "^2.88.0"
+    "compare-versions": "^3.4.0",
+    "promisify-child-process": "^2.1.2",
+    "request": "^2.88.0",
+    "vscode-jsonrpc": "4.0.0",
+    "vscode-languageclient": "^5.2.1",
+    "vscode-languageserver": "^5.2.1",
+    "ws": "^6.1.4"
   },
   "devDependencies": {
-    "@types/compare-versions": "^3.0.0",
-    "@types/mocha": "^5.2.5",
-    "@types/node": "^8.10.32",
-    "@types/ws": "^6.0.0",
     "@types/archiver": "^2.1.2",
-    "@types/request": "^2.47.1",
-    "typescript": "^2.9.2",
-    "vscode": "^1.1.21"
+    "@types/compare-versions": "^3.0.0",
+    "@types/mocha": "^5.2.6",
+    "@types/node": "^10.12.26",
+    "@types/request": "^2.48.1",
+    "@types/ws": "^6.0.1",
+    "typescript": "^3.2.4",
+    "vscode": "^1.1.29"
   }
 }

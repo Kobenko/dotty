@@ -1,5 +1,3 @@
-
-import scala.quoted.Toolbox.Default._
 import scala.quoted._
 
 // DYNAMIC
@@ -7,6 +5,8 @@ import scala.quoted._
 object Test {
 
   def main(args: Array[String]): Unit = {
+    implicit val toolbox: scala.quoted.Toolbox = scala.quoted.Toolbox.make(getClass.getClassLoader)
+
     {
       val intComplex = new RingComplex(RingInt)
       import intComplex._
@@ -18,7 +18,7 @@ object Test {
       val intExprComplex = new RingComplex(RingIntExpr)
       import intExprComplex._
 
-      val res = Complex('(1), '(2)) * Complex('(4), '(2))
+      val res = Complex('{1}, '{2}) * Complex('{4}, '{2})
       println(s"Complex(${res.re.show}, ${res.im.show})")
     }
 
@@ -26,7 +26,7 @@ object Test {
     //   val intExprComplex = implicitly[Ring[Expr[Complex[Int]]]]
     //   import intExprComplex._
 
-    //   val res = '(Complex(1, 2)) * '(Complex(4, 2))
+    //   val res = '{Complex(1, 2)} * '{Complex(4, 2)}
     //   println(res.show)
     // }
 

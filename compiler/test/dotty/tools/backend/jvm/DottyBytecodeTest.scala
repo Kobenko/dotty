@@ -46,6 +46,7 @@ trait DottyBytecodeTest {
   def initCtx = {
     val ctx0 = (new ContextBase).initialCtx.fresh
     val outputDir = new VirtualDirectory("<DottyBytecodeTest output>")
+    ctx0.setSetting(ctx0.settings.silentWarnings, true)
     ctx0.setSetting(ctx0.settings.classpath, TestConfiguration.basicClasspath)
     ctx0.setProperty(ContextDoc, new ContextDocstrings)
     ctx0.setSetting(ctx0.settings.outputDir, outputDir)
@@ -72,6 +73,10 @@ trait DottyBytecodeTest {
   protected def getMethod(classNode: ClassNode, name: String): MethodNode =
     classNode.methods.asScala.find(_.name == name) getOrElse
       sys.error(s"Didn't find method '$name' in class '${classNode.name}'")
+
+  protected def getField(classNode: ClassNode, name: String): FieldNode =
+    classNode.fields.asScala.find(_.name == name) getOrElse
+      sys.error(s"Didn't find field '$name' in class '${classNode.name}'")
 
   def diffInstructions(isa: List[Instruction], isb: List[Instruction]): String = {
     val len = Math.max(isa.length, isb.length)

@@ -10,11 +10,12 @@ import Symbols._
 import NameOps._
 import TypeErasure.ErasedValueType
 import Contexts.Context
+import Annotations.Annotation
 import Denotations._
 import SymDenotations._
 import StdNames.{nme, tpnme}
 import ast.{Trees, untpd}
-import typer.{Implicits, Namer}
+import typer.{Implicits, Namer, Applications}
 import typer.ProtoTypes._
 import Trees._
 import TypeApplications._
@@ -23,7 +24,7 @@ import scala.tasty.util.Chars.isOperatorPart
 import transform.TypeUtils._
 
 import language.implicitConversions
-import dotty.tools.dotc.util.SourcePosition
+import dotty.tools.dotc.util.{NameTransformer, SourcePosition}
 import dotty.tools.dotc.ast.untpd.{MemberDef, Modifiers, PackageDef, RefTree, Template, TypeDef, ValOrDefDef}
 
 class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
@@ -68,10 +69,13 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
 
   override protected def recursionLimitExceeded(): Unit = {}
 
-  protected val PrintableFlags: FlagSet = (SourceModifierFlags | Module | Local).toCommonFlags
+  protected def PrintableFlags(isType: Boolean): FlagSet = {
+    if (isType) TypeSourceModifierFlags | Module | Local
+    else TermSourceModifierFlags | Module | Local
+  }.toCommonFlags
 
   override def nameString(name: Name): String =
-    if (ctx.settings.YdebugNames.value) name.debugString else name.toString
+    if (ctx.settings.YdebugNames.value) name.debugString else NameTransformer.decodeIllegalChars(name.toString)
 
   override protected def simpleNameString(sym: Symbol): String =
     nameString(if (ctx.property(XprintMode).isEmpty) sym.originalName else sym.name)
@@ -105,7 +109,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         if (isOmittable(tp.cls)) return ""
       case tp @ TermRef(pre, _) =>
         val sym = tp.symbol
-        if (sym.isPackageObject) return toTextPrefix(pre)
+        if (sym.isPackageObject && !homogenizedView) return toTextPrefix(pre)
         if (isOmittable(sym)) return ""
       case _ =>
     }
@@ -125,20 +129,22 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     def toTextTuple(args: List[Type]): Text =
       "(" ~ argsText(args) ~ ")"
 
-    def toTextFunction(args: List[Type], isImplicit: Boolean, isErased: Boolean): Text =
+    def toTextFunction(args: List[Type], isContextual: Boolean, isErased: Boolean): Text =
       changePrec(GlobalPrec) {
         val argStr: Text =
           if (args.length == 2 && !defn.isTupleType(args.head))
             atPrec(InfixPrec) { argText(args.head) }
           else
             toTextTuple(args.init)
-        (keywordText("erased ") provided isErased) ~ (keywordText("implicit ") provided isImplicit) ~ argStr ~ " => " ~ argText(args.last)
+        (keywordText("given ") provided isContextual) ~
+        (keywordText("erased ") provided isErased) ~
+        argStr ~ " => " ~ argText(args.last)
       }
 
-    def toTextDependentFunction(appType: MethodType): Text = {
-      (keywordText("implicit ") provided appType.isImplicitMethod) ~
+    def toTextDependentFunction(appType: MethodType): Text =
+      (keywordText("given ") provided appType.isImplicitMethod) ~
+      (keywordText("erased ") provided appType.isErasedMethod) ~
       "(" ~ paramsText(appType) ~ ") => " ~ toText(appType.resultType)
-    }
 
     def isInfixType(tp: Type): Boolean = tp match {
       case AppliedType(tycon, args) =>
@@ -173,7 +179,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         val cls = tycon.typeSymbol
         if (tycon.isRepeatedParam) return toTextLocal(args.head) ~ "*"
         if (defn.isFunctionClass(cls)) return toTextFunction(args, cls.name.isImplicitFunction, cls.name.isErasedFunction)
-        if (tp.tupleArity >= 2) return toTextTuple(tp.tupleElementTypes)
+        if (tp.tupleArity >= 2 && !ctx.settings.YprintDebug.value) return toTextTuple(tp.tupleElementTypes)
         if (isInfixType(tp)) {
           val l :: r :: Nil = args
           val opName = tyconName(tycon)
@@ -188,7 +194,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case OrType(tp1, tp2) =>
         return toTextInfixType(tpnme.raw.BAR, tp1, tp2) { toText(tpnme.raw.BAR) }
 
-      case EtaExpansion(tycon) =>
+      case EtaExpansion(tycon) if !ctx.settings.YprintDebug.value =>
         return toText(tycon)
       case tp: RefinedType if defn.isFunctionType(tp) =>
         return toTextDependentFunction(tp.refinedInfo.asInstanceOf[MethodType])
@@ -226,11 +232,11 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
           case dummyTreeOfType(tp) :: Nil if !(tp isRef defn.NullClass) => "null: " ~ toText(tp)
           case _ => toTextGlobal(args, ", ")
         }
-        return "FunProto(" ~ argsText ~ "):" ~ toText(resultType)
-      case tp: IgnoredProto =>
-        return "?"
+        return "[applied to " ~ (Str("given ") provided tp.isContextual) ~ "(" ~ argsText ~ ") returning " ~ toText(resultType) ~ "]"
+      case IgnoredProto(ignored) =>
+        return "?" ~ (("(ignored: " ~ toText(ignored) ~ ")") provided ctx.settings.verbose.value)
       case tp @ PolyProto(targs, resType) =>
-        return "PolyProto(" ~ toTextGlobal(targs, ", ") ~ "): " ~ toText(resType)
+        return "[applied to [" ~ toTextGlobal(targs, ", ") ~ "] returning " ~ toText(resType)
       case _ =>
     }
     super.toText(tp)
@@ -245,8 +251,17 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
   protected def blockText[T >: Untyped](trees: List[Tree[T]]): Text =
     ("{" ~ toText(trees, "\n") ~ "}").close
 
-  protected def typeApplyText[T >: Untyped](tree: TypeApply[T]): Text =
-    toTextLocal(tree.fun) ~ "[" ~ toTextGlobal(tree.args, ", ") ~ "]"
+  protected def typeApplyText[T >: Untyped](tree: TypeApply[T]): Text = {
+    val isQuote = !ctx.settings.YprintDebug.value && tree.fun.hasType && tree.fun.symbol == defn.InternalQuoted_typeQuote
+    val (open, close) = if (isQuote) (keywordStr("'["), keywordStr("]")) else ("[", "]")
+    val funText = toTextLocal(tree.fun).provided(!isQuote)
+    tree.fun match {
+      case Select(New(tpt), nme.CONSTRUCTOR) if tpt.typeOpt.dealias.isInstanceOf[AppliedType] =>
+        funText  // type was already printed by toText(new)
+      case _ =>
+        funText ~ open ~ toTextGlobal(tree.args, ", ") ~ close
+    }
+  }
 
   protected def toTextCore[T >: Untyped](tree: Tree[T]): Text = {
     import untpd.{modsDeco => _, _}
@@ -293,13 +308,18 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case _ => toTextGlobal(arg)
     }
 
+    def dropBlock(tree: Tree): Tree = tree match {
+      case Block(Nil, expr) => expr
+      case _ => tree
+    }
+
     tree match {
       case id: Trees.BackquotedIdent[_] if !homogenizedView =>
         "`" ~ toText(id.name) ~ "`"
       case id: Trees.SearchFailureIdent[_] =>
         tree.typeOpt match {
           case reason: Implicits.SearchFailureType =>
-            toText(id.name) ~ "implicitly[" ~ toText(reason.expectedType) ~ "]"
+            toText(id.name) ~ "implicitly[" ~ toText(reason.clarify(reason.expectedType)) ~ "]"
           case _ =>
             toText(id.name)
         }
@@ -307,15 +327,16 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         val txt = tree.typeOpt match {
           case tp: NamedType if name != nme.WILDCARD =>
             val pre = if (tp.symbol is JavaStatic) tp.prefix.widen else tp.prefix
-            toTextPrefix(pre) ~ withPos(selectionString(tp), tree.pos)
+            toTextPrefix(pre) ~ withPos(selectionString(tp), tree.sourcePos)
           case _ =>
             toText(name)
         }
         if (name.isTypeName) typeText(txt)
         else txt
       case tree @ Select(qual, name) =>
-        if (qual.isType) toTextLocal(qual) ~ "#" ~ typeText(toText(name))
-        else toTextLocal(qual) ~ ("." ~ nameIdText(tree) provided name != nme.CONSTRUCTOR)
+        if (!ctx.settings.YprintDebug.value && tree.hasType && tree.symbol == defn.QuotedType_splice) typeText("${") ~ toTextLocal(qual) ~ typeText("}")
+        else if (qual.isType) toTextLocal(qual) ~ "#" ~ typeText(toText(name))
+        else toTextLocal(qual) ~ ("." ~ nameIdText(tree) provided (name != nme.CONSTRUCTOR || ctx.settings.YprintDebug.value))
       case tree: This =>
         optDotPrefix(tree) ~ keywordStr("this") ~ idText(tree)
       case Super(qual: This, mix) =>
@@ -325,24 +346,24 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
           changePrec (GlobalPrec) {
             keywordStr("throw ") ~ toText(args.head)
           }
+        else if (!ctx.settings.YprintDebug.value && fun.hasType && fun.symbol == defn.InternalQuoted_exprQuote)
+          keywordStr("'{") ~ toTextGlobal(args, ", ") ~ keywordStr("}")
+        else if (!ctx.settings.YprintDebug.value && fun.hasType && fun.symbol == defn.InternalQuoted_exprSplice)
+          keywordStr("${") ~ toTextGlobal(args, ", ") ~ keywordStr("}")
         else
           toTextLocal(fun) ~ "(" ~ toTextGlobal(args, ", ") ~ ")"
       case tree: TypeApply =>
         typeApplyText(tree)
       case Literal(c) =>
         tree.typeOpt match {
-          case ConstantType(tc) => withPos(toText(tc), tree.pos)
-          case _ => withPos(toText(c), tree.pos)
+          case ConstantType(tc) => withPos(toText(tc), tree.sourcePos)
+          case _ => withPos(toText(c), tree.sourcePos)
         }
       case New(tpt) =>
         keywordStr("new ") ~ {
           tpt match {
             case tpt: Template => toTextTemplate(tpt, ofNew = true)
-            case _ =>
-              if (tpt.hasType)
-                toTextLocal(tpt.typeOpt.underlyingClassRef(refinementOK = false))
-              else
-                toTextLocal(tpt)
+            case _ => toTextLocal(tpt)
           }
         }
       case Typed(expr, tpt) =>
@@ -358,15 +379,26 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case block: Block =>
         blockToText(block)
       case If(cond, thenp, elsep) =>
+        val isInline = tree.isInstanceOf[Trees.InlineIf[_]]
         changePrec(GlobalPrec) {
-          keywordStr("if ") ~ toText(cond) ~ (keywordText(" then") provided !cond.isInstanceOf[Parens]) ~~ toText(thenp) ~ optText(elsep)(keywordStr(" else ") ~ _)
+          keywordStr(if (isInline) "inline if " else "if ") ~
+          toText(cond) ~ (keywordText(" then") provided !cond.isInstanceOf[Parens]) ~~
+          toText(thenp) ~ optText(elsep)(keywordStr(" else ") ~ _)
         }
       case Closure(env, ref, target) =>
         "closure(" ~ (toTextGlobal(env, ", ") ~ " | " provided env.nonEmpty) ~
         toTextGlobal(ref) ~ (":" ~ toText(target) provided !target.isEmpty) ~ ")"
       case Match(sel, cases) =>
-        if (sel.isEmpty) blockText(cases)
-        else changePrec(GlobalPrec) { toText(sel) ~ keywordStr(" match ") ~ blockText(cases) }
+        val isInline = tree.isInstanceOf[Trees.InlineMatch[_]]
+        if (sel.isEmpty && !isInline) blockText(cases)
+        else changePrec(GlobalPrec) {
+          val selTxt: Text =
+            if (isInline)
+              if (sel.isEmpty) keywordStr("implicit")
+              else keywordStr("inline ") ~ toText(sel)
+            else toText(sel)
+          selTxt ~ keywordStr(" match ") ~ blockText(cases)
+        }
       case CaseDef(pat, guard, body) =>
         keywordStr("case ") ~ inPattern(toText(pat)) ~ optText(guard)(keywordStr(" if ") ~ _) ~ " => " ~ caseBlockText(body)
       case Labeled(bind, expr) =>
@@ -390,8 +422,8 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case SeqLiteral(elems, elemtpt) =>
         "[" ~ toTextGlobal(elems, ",") ~ " : " ~ toText(elemtpt) ~ "]"
       case tree @ Inlined(call, bindings, body) =>
-        (("/* inlined from " ~ toText(call) ~ " */ ") `provided`
-          !call.isEmpty && !homogenizedView && !ctx.settings.YshowNoInline.value) ~
+        (("/* inlined from " ~ (if (call.isEmpty) "outside" else toText(call)) ~ " */ ") `provided`
+          !homogenizedView && ctx.settings.XprintInline.value) ~
         blockText(bindings :+ body)
       case tpt: untpd.DerivedTypeTree =>
         "<derived typetree watching " ~ summarized(toText(tpt.watched)) ~ ">"
@@ -399,14 +431,15 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         typeText(toText(tree.typeOpt))
       case SingletonTypeTree(ref) =>
         toTextLocal(ref) ~ "." ~ keywordStr("type")
-      case AndTypeTree(l, r) =>
-        changePrec(AndTypePrec) { toText(l) ~ " & " ~ atPrec(AndTypePrec + 1) { toText(r) } }
-      case OrTypeTree(l, r) =>
-        changePrec(OrTypePrec) { toText(l) ~ " | " ~ atPrec(OrTypePrec + 1) { toText(r) } }
       case RefinedTypeTree(tpt, refines) =>
         toTextLocal(tpt) ~ " " ~ blockText(refines)
       case AppliedTypeTree(tpt, args) =>
-        toTextLocal(tpt) ~ "[" ~ Text(args map argText, ", ") ~ "]"
+        if (tpt.symbol == defn.orType && args.length == 2)
+          changePrec(OrTypePrec) { toText(args(0)) ~ " | " ~ atPrec(OrTypePrec + 1) { toText(args(1)) } }
+        else if (tpt.symbol == defn.andType && args.length == 2)
+          changePrec(AndTypePrec) { toText(args(0)) ~ " & " ~ atPrec(AndTypePrec + 1) { toText(args(1)) } }
+        else
+          toTextLocal(tpt) ~ "[" ~ Text(args map argText, ", ") ~ "]"
       case LambdaTypeTree(tparams, body) =>
         changePrec(GlobalPrec) {
           tparamsText(tparams) ~ " -> " ~ toText(body)
@@ -440,7 +473,8 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       case tree @ TypeDef(name, rhs) =>
         def typeDefText(tparamsText: => Text, rhsText: => Text) =
           dclTextOr(tree) {
-            modText(tree.mods, tree.symbol, keywordStr("type")) ~~ (varianceText(tree.mods) ~ typeText(nameIdText(tree))) ~
+            modText(tree.mods, tree.symbol, keywordStr("type"), isType = true) ~~
+            (varianceText(tree.mods) ~ typeText(nameIdText(tree))) ~
             withEnclosingDef(tree) { tparamsText ~ rhsText }
           }
         def recur(rhs: Tree, tparamsTxt: => Text): Text = rhs match {
@@ -450,13 +484,13 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
             typeDefText(tparamsTxt, toText(rhs))
           case LambdaTypeTree(tparams, body) =>
             recur(body, tparamsText(tparams))
-          case rhs: TypeTree if rhs.typeOpt.isInstanceOf[TypeBounds] =>
+          case rhs: TypeTree if isBounds(rhs.typeOpt) =>
             typeDefText(tparamsTxt, toText(rhs))
           case rhs =>
             typeDefText(tparamsTxt, optText(rhs)(" = " ~ _))
         }
         recur(rhs, "")
-      case Import(expr, selectors) =>
+      case Import(importImplied, expr, selectors) =>
         def selectorText(sel: Tree): Text = sel match {
           case Thicket(l :: r :: Nil) => toTextGlobal(l) ~ " => " ~ toTextGlobal(r)
           case _ => toTextGlobal(sel)
@@ -465,7 +499,8 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
           case id :: Nil => toText(id)
           case _ => "{" ~ Text(selectors map selectorText, ", ") ~ "}"
         }
-        keywordStr("import ") ~ toTextLocal(expr) ~ "." ~ selectorsText
+        keywordText("import ") ~ (keywordText("implied ") provided importImplied) ~
+        toTextLocal(expr) ~ "." ~ selectorsText
       case packageDef: PackageDef =>
         packageDefText(packageDef)
       case tree: Template =>
@@ -479,12 +514,13 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         else toText(t)
       case tree @ ModuleDef(name, impl) =>
         withEnclosingDef(tree) {
-          modText(tree.mods, NoSymbol, keywordStr("object")) ~~ nameIdText(tree) ~ toTextTemplate(impl)
+          modText(tree.mods, NoSymbol, keywordStr("object"), isType = false) ~~
+          nameIdText(tree) ~ toTextTemplate(impl)
         }
       case SymbolLit(str) =>
         "'" + str
       case InterpolatedString(id, segments) =>
-        def strText(str: Literal) = withPos(escapedString(str.const.stringValue), tree.pos)
+        def strText(str: Literal) = withPos(escapedString(str.const.stringValue), tree.sourcePos)
         def segmentText(segment: Tree) = segment match {
           case Thicket(List(str: Literal, expr)) => strText(str) ~ "{" ~ toTextGlobal(expr) ~ "}"
           case str: Literal => strText(str)
@@ -492,10 +528,12 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
         toText(id) ~ "\"" ~ Text(segments map segmentText, "") ~ "\""
       case Function(args, body) =>
         var implicitSeen: Boolean = false
+        var contextual: Boolean = false
         def argToText(arg: Tree) = arg match {
           case arg @ ValDef(name, tpt, _) =>
             val implicitText =
-              if ((arg.mods is Implicit) && !implicitSeen) { implicitSeen = true; keywordStr("implicit ") }
+              if ((arg.mods is Given)) { contextual = true; "" }
+              else if ((arg.mods is Implicit) && !implicitSeen) { implicitSeen = true; keywordStr("implicit ") }
               else ""
             implicitText ~ toText(name) ~ optAscription(tpt)
           case _ =>
@@ -506,6 +544,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
           case _ => "(" ~ Text(args map argToText, ", ") ~ ")"
         }
         changePrec(GlobalPrec) {
+		  (keywordText("given ") provided contextual) ~
           argsText ~ " => " ~ toText(body)
         }
       case InfixOp(l, op, r) =>
@@ -534,14 +573,19 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
           t ~ cxBoundToText(cxb)
         }
       case PatDef(mods, pats, tpt, rhs) =>
-        modText(mods, NoSymbol, keywordStr("val")) ~~ toText(pats, ", ") ~ optAscription(tpt) ~
-          optText(rhs)(" = " ~ _)
+        modText(mods, NoSymbol, keywordStr("val"), isType = false) ~~
+        toText(pats, ", ") ~ optAscription(tpt) ~ optText(rhs)(" = " ~ _)
       case ParsedTry(expr, handler, finalizer) =>
         changePrec(GlobalPrec) {
           keywordStr("try ") ~ toText(expr) ~ " " ~ keywordStr("catch") ~ " {" ~ toText(handler) ~ "}" ~ optText(finalizer)(keywordStr(" finally ") ~ _)
         }
       case Quote(tree) =>
-        if (tree.isType) "'[" ~ toTextGlobal(tree) ~ "]" else "'(" ~ toTextGlobal(tree) ~ ")"
+        if (tree.isType) keywordStr("'[") ~ toTextGlobal(dropBlock(tree)) ~ keywordStr("]")
+        else keywordStr("'{") ~ toTextGlobal(dropBlock(tree)) ~ keywordStr("}")
+      case Splice(tree) =>
+        keywordStr("${") ~ toTextGlobal(dropBlock(tree)) ~ keywordStr("}")
+      case tree: Applications.IntegratedTypeArgs =>
+        toText(tree.app) ~ Str("(with integrated type args)").provided(ctx.settings.YprintDebug.value)
       case Thicket(trees) =>
         "Thicket {" ~~ toTextGlobal(trees, "\n") ~~ "}"
       case _ =>
@@ -572,15 +616,6 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       // add type to term nodes; replace type nodes with their types unless -Yprint-pos is also set.
       def tp = tree.typeOpt match {
         case tp: TermRef if tree.isInstanceOf[RefTree] && !tp.denot.isOverloaded => tp.underlying
-        case tp: ConstantType if homogenizedView =>
-          // constant folded types are forgotten in Tasty, are reconstituted subsequently in FirstTransform.
-          // Therefore we have to gloss over this when comparing before/after pickling by widening to
-          // underlying type `T`, or, if expression is a unary primitive operation, to `=> T`.
-          tree match {
-            case Select(qual, _) if qual.typeOpt.widen.typeSymbol.isPrimitiveValueClass =>
-              ExprType(tp.widen)
-            case _ => tp.widen
-          }
         case tp => tp
       }
       if (!suppressTypes)
@@ -590,15 +625,18 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     }
     if (!suppressPositions) {
       if (printPos) {
-        val pos =
-          if (homogenizedView && !tree.isInstanceOf[MemberDef]) tree.pos.toSynthetic
-          else tree.pos
+        val posStr =
+          if (homogenizedView || debugPos)
+            if (tree.isInstanceOf[MemberDef]) Str(s"${tree.source}${tree.span}")
+            else Str(s"${tree.source}${tree.span.toSynthetic}")
+          else
+            "<" ~ toText(tree.sourcePos) ~ ">"
         val clsStr = ""//if (tree.isType) tree.getClass.toString else ""
-        txt = (txt ~ "@" ~ pos.toString ~ clsStr).close
+        txt = (txt ~ "@" ~ posStr ~ clsStr).close
       }
       if (ctx.settings.YprintPosSyms.value && tree.isDef)
         txt = (txt ~
-          s"@@(${tree.symbol.name}=" ~ tree.symbol.pos.toString ~ ")").close
+          s"@@(${tree.symbol.name}=" ~ tree.symbol.sourcePos.toString ~ ")").close
     }
     if (ctx.settings.YshowTreeIds.value)
       txt = (txt ~ "#" ~ tree.uniqueId.toString).close
@@ -617,7 +655,9 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
   def Modifiers(sym: Symbol)(implicit ctx: Context): Modifiers = untpd.Modifiers(
     sym.flags & (if (sym.isType) ModifierFlags | VarianceFlags else ModifierFlags),
     if (sym.privateWithin.exists) sym.privateWithin.asType.name else tpnme.EMPTY,
-    sym.annotations map (_.tree))
+    sym.annotations.filterNot(ann => dropAnnotForModText(ann.symbol)).map(_.tree))
+
+  protected def dropAnnotForModText(sym: Symbol): Boolean = sym == defn.BodyAnnot
 
   protected def optAscription[T >: Untyped](tpt: Tree[T]): Text = optText(tpt)(": " ~ _)
 
@@ -632,8 +672,8 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     if (tree.hasType && tree.symbol.exists) {
       val str: Text = nameString(tree.symbol)
       tree match {
-        case tree: RefTree => withPos(str, tree.pos)
-        case tree: MemberDef => withPos(str, tree.namePos)
+        case tree: RefTree => withPos(str, tree.sourcePos)
+        case tree: MemberDef => withPos(str, tree.sourcePos.withSpan(tree.nameSpan))
         case _ => str
       }
     }
@@ -652,13 +692,17 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
   def tparamsText[T >: Untyped](params: List[Tree[T]]): Text =
     "[" ~ toText(params, ", ") ~ "]" provided params.nonEmpty
 
-  def addVparamssText[T >: Untyped](txt: Text, vparamss: List[List[ValDef[T]]]): Text =
-    (txt /: vparamss)((txt, vparams) => txt ~ "(" ~ toText(vparams, ", ") ~ ")")
-
+  def addVparamssText[T >: Untyped](txt: Text, vparamss: List[List[ValDef[T]]], isExtension: Boolean = false): Text = {
+    def paramsText(params: List[ValDef[T]]) = "(" ~ toText(params, ", ") ~ ")"
+    val (leading, paramss) =
+      if (isExtension && vparamss.nonEmpty) (paramsText(vparamss.head) ~ " " ~ txt, vparamss.tail)
+      else (txt, vparamss)
+    (txt /: paramss)((txt, params) => txt ~ paramsText(params))
+  }
   protected def valDefToText[T >: Untyped](tree: ValDef[T]): Text = {
     import untpd.{modsDeco => _}
     dclTextOr(tree) {
-      modText(tree.mods, tree.symbol, keywordStr(if (tree.mods is Mutable) "var" else "val")) ~~
+      modText(tree.mods, tree.symbol, keywordStr(if (tree.mods is Mutable) "var" else "val"), isType = false) ~~
         valDefText(nameIdText(tree)) ~ optAscription(tree.tpt) ~
         withEnclosingDef(tree) { optText(tree.rhs)(" = " ~ _) }
     }
@@ -667,27 +711,30 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
   protected def defDefToText[T >: Untyped](tree: DefDef[T]): Text = {
     import untpd.{modsDeco => _}
     dclTextOr(tree) {
-      val prefix = modText(tree.mods, tree.symbol, keywordStr("def")) ~~ valDefText(nameIdText(tree))
+      val prefix = modText(tree.mods, tree.symbol, keywordStr("def"), isType = false) ~~ valDefText(nameIdText(tree))
+      val isExtension = tree.hasType && tree.symbol.is(Extension)
       withEnclosingDef(tree) {
-          addVparamssText(prefix ~ tparamsText(tree.tparams), tree.vparamss) ~ optAscription(tree.tpt) ~
-            optText(tree.rhs)(" = " ~ _)
+        addVparamssText(prefix ~ tparamsText(tree.tparams), tree.vparamss, isExtension) ~
+          optAscription(tree.tpt) ~
+          optText(tree.rhs)(" = " ~ _)
       }
     }
   }
 
   protected def toTextTemplate(impl: Template, ofNew: Boolean = false): Text = {
-    val Template(constr @ DefDef(_, tparams, vparamss, _, _), parents, self, _) = impl
+    val Template(constr @ DefDef(_, tparams, vparamss, _, _), _, self, _) = impl
     val tparamsTxt = withEnclosingDef(constr) { tparamsText(tparams) }
     val primaryConstrs = if (constr.rhs.isEmpty) Nil else constr :: Nil
     val prefix: Text =
       if (vparamss.isEmpty || primaryConstrs.nonEmpty) tparamsTxt
       else {
-        var modsText = modText(constr.mods, constr.symbol, "")
+        var modsText = modText(constr.mods, constr.symbol, "", isType = false)
         if (!modsText.isEmpty) modsText = " " ~ modsText
         if (constr.mods.hasAnnotations && !constr.mods.hasFlags) modsText = modsText ~~ " this"
         withEnclosingDef(constr) { addVparamssText(tparamsTxt ~~ modsText, vparamss) }
       }
-    val parentsText = Text(parents map constrText, keywordStr(" with "))
+    val parentsText = Text(impl.parents.map(constrText), if (ofNew) keywordStr(" with ") else ", ")
+    val derivedText = Text(impl.derived.map(toText(_)), ", ")
     val selfText = {
       val selfName = if (self.name == nme.WILDCARD) keywordStr("this") else self.name.toString
       (selfName ~ optText(self.tpt)(": " ~ _) ~ " =>").close
@@ -705,11 +752,14 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
 
     val bodyText = " {" ~~ selfText ~~ toTextGlobal(primaryConstrs ::: body, "\n") ~ "}"
 
-    prefix ~ keywordText(" extends").provided(!ofNew && parents.nonEmpty) ~~ parentsText ~ bodyText
+    prefix ~
+    keywordText(" extends").provided(!ofNew && impl.parents.nonEmpty) ~~ parentsText ~
+    keywordText(" derives").provided(impl.derived.nonEmpty) ~~ derivedText ~
+    bodyText
   }
 
   protected def templateText(tree: TypeDef, impl: Template): Text = {
-    val decl = modText(tree.mods, tree.symbol, keywordStr(if ((tree).mods is Trait) "trait" else "class"))
+    val decl = modText(tree.mods, tree.symbol, keywordStr(if ((tree).mods is Trait) "trait" else "class"), isType = true)
     decl ~~ typeText(nameIdText(tree)) ~ withEnclosingDef(tree) { toTextTemplate(impl) } ~
       (if (tree.hasType && ctx.settings.verbose.value) i"[decls = ${tree.symbol.info.decls}]" else "")
   }
@@ -732,22 +782,20 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
 
   protected def annotText(tree: untpd.Tree): Text = "@" ~ constrText(tree) // DD
 
-  protected def modText(mods: untpd.Modifiers, sym: Symbol, kw: String, suppress: FlagSet = EmptyFlags): Text = { // DD
+  protected def modText(mods: untpd.Modifiers, sym: Symbol, kw: String, isType: Boolean): Text = { // DD
     val suppressKw = if (enclDefIsClass) mods is ParamAndLocal else mods is Param
     var flagMask =
       if (ctx.settings.YdebugFlags.value) AnyFlags
-      else if (suppressKw) PrintableFlags &~ Private &~ suppress
-      else PrintableFlags &~ suppress
-    if (homogenizedView && mods.flags.isTypeFlags) flagMask &~= Implicit // drop implicit from classes
+      else if (suppressKw) PrintableFlags(isType) &~ Private
+      else PrintableFlags(isType)
+    if (homogenizedView && mods.flags.isTypeFlags) flagMask &~= ImplicitOrImplied // drop implicit/implied from classes
     val flags = (if (sym.exists) sym.flags else (mods.flags)) & flagMask
     val flagsText = if (flags.isEmpty) "" else keywordStr(flags.toString)
-    val annotations = filterModTextAnnots(
-      if (sym.exists) sym.annotations.filterNot(_.isInstanceOf[Annotations.BodyAnnotation]).map(_.tree)
-      else mods.annotations)
+    val annotations =
+      if (sym.exists) sym.annotations.filterNot(ann => dropAnnotForModText(ann.symbol)).map(_.tree)
+      else mods.annotations.filterNot(tree => dropAnnotForModText(tree.symbol))
     Text(annotations.map(annotText), " ") ~~ flagsText ~~ (Str(kw) provided !suppressKw)
   }
-
-  protected def filterModTextAnnots(annots: List[untpd.Tree]): List[untpd.Tree] = annots
 
   def optText(name: Name)(encl: Text => Text): Text =
     if (name.isEmpty) "" else encl(toText(name))
@@ -776,7 +824,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
       }
     if (sym.is(ModuleClass)) {
       val name =
-        if (sym.isPackageObject) sym.owner.name
+        if (sym.isPackageObject && sym.name.stripModuleClassSuffix == tpnme.PACKAGE) sym.owner.name
         else sym.name.stripModuleClassSuffix
       kindString(sym) ~~ (nameString(name) + idString(sym))
     }
@@ -790,7 +838,6 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     if (flags is Package) "package"
     else if (sym.isPackageObject) "package object"
     else if (flags is Module) "object"
-    else if (flags is ImplClass) "class"
     else if (sym.isClassConstructor) "constructor"
     else super.kindString(sym)
   }
@@ -811,7 +858,7 @@ class RefinedPrinter(_ctx: Context) extends PlainPrinter(_ctx) {
     else {
       var flags = sym.flagsUNSAFE
       if (flags is TypeParam) flags = flags &~ Protected
-      Text((flags & PrintableFlags).flagStrings map (flag => stringToText(keywordStr(flag))), " ")
+      Text((flags & PrintableFlags(sym.isType)).flagStrings map (flag => stringToText(keywordStr(flag))), " ")
     }
 
   override def toText(denot: Denotation): Text = denot match {

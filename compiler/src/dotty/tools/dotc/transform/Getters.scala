@@ -61,10 +61,14 @@ class Getters extends MiniPhase with SymTransformer {
 
     var d1 =
       if (d.isTerm && (d.is(Lazy) || d.owner.isClass) && d.info.isValueType && !noGetterNeeded) {
-        val maybeStable = if (d.isStable) Stable else EmptyFlags
+        val maybeStable = if (d.isStableMember) StableRealizable else EmptyFlags
         d.copySymDenotation(
           initFlags = d.flags | maybeStable | AccessorCreationFlags,
           info = ExprType(d.info))
+            // Note: This change will only affect the SymDenotation itself, not
+            // SingleDenotations referring to a getter. In this case it does not
+            // seem to be a problem since references to a getter don't care whether
+            // it's a `T` or a `=> T`
       }
       else d
 
@@ -78,10 +82,10 @@ class Getters extends MiniPhase with SymTransformer {
   private val NoGetterNeeded = Method | Param | JavaDefined | JavaStatic
 
   override def transformValDef(tree: ValDef)(implicit ctx: Context): Tree =
-    if (tree.symbol is Method) DefDef(tree.symbol.asTerm, tree.rhs).withPos(tree.pos) else tree
+    if (tree.symbol is Method) DefDef(tree.symbol.asTerm, tree.rhs).withSpan(tree.span) else tree
 
   override def transformAssign(tree: Assign)(implicit ctx: Context): Tree =
-    if (tree.lhs.symbol is Method) tree.lhs.becomes(tree.rhs).withPos(tree.pos) else tree
+    if (tree.lhs.symbol is Method) tree.lhs.becomes(tree.rhs).withSpan(tree.span) else tree
 }
 
 object Getters {

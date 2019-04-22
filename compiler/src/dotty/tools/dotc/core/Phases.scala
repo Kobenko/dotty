@@ -79,16 +79,25 @@ object Phases {
       * whereas a combined TreeTransformer gets period equal to union of periods of it's TreeTransforms
       */
     final def squashPhases(phasess: List[List[Phase]],
-                             phasesToSkip: List[String], stopBeforePhases: List[String], stopAfterPhases: List[String], YCheckAfter: List[String]): List[Phase] = {
+                           phasesToSkip: List[String],
+                           stopBeforePhases: List[String],
+                           stopAfterPhases: List[String],
+                           YCheckAfter: List[String])(implicit ctx: Context): List[Phase] = {
       val squashedPhases = ListBuffer[Phase]()
       var prevPhases: Set[String] = Set.empty
       val YCheckAll = YCheckAfter.contains("all")
 
       var stop = false
+
+      def isEnabled(p: Phase): Boolean =
+        !stop &&
+        !stopBeforePhases.contains(p.phaseName) &&
+        !phasesToSkip.contains(p.phaseName) &&
+        p.isEnabled
+
       val filteredPhases = phasess.map(_.filter { p =>
-        val pstop = stop
-        stop = stop | stopBeforePhases.contains(p.phaseName) | stopAfterPhases.contains(p.phaseName)
-        !(pstop || stopBeforePhases.contains(p.phaseName) || phasesToSkip.contains(p.phaseName))
+        try isEnabled(p)
+        finally stop |= stopBeforePhases.contains(p.phaseName) | stopAfterPhases.contains(p.phaseName)
       })
 
       var i = 0
@@ -208,8 +217,10 @@ object Phases {
     }
 
     private[this] var myTyperPhase: Phase = _
+    private[this] var myPostTyperPhase: Phase = _
     private[this] var mySbtExtractDependenciesPhase: Phase = _
     private[this] var myPicklerPhase: Phase = _
+    private[this] var myReifyQuotesPhase: Phase = _
     private[this] var myCollectNullableFieldsPhase: Phase = _
     private[this] var myRefChecksPhase: Phase = _
     private[this] var myPatmatPhase: Phase = _
@@ -224,8 +235,10 @@ object Phases {
     private[this] var myGenBCodePhase: Phase = _
 
     final def typerPhase: Phase = myTyperPhase
+    final def postTyperPhase: Phase = myPostTyperPhase
     final def sbtExtractDependenciesPhase: Phase = mySbtExtractDependenciesPhase
     final def picklerPhase: Phase = myPicklerPhase
+    final def reifyQuotesPhase: Phase = myReifyQuotesPhase
     final def collectNullableFieldsPhase: Phase = myCollectNullableFieldsPhase
     final def refchecksPhase: Phase = myRefChecksPhase
     final def patmatPhase: Phase = myPatmatPhase
@@ -243,8 +256,10 @@ object Phases {
       def phaseOfClass(pclass: Class[_]) = phases.find(pclass.isInstance).getOrElse(NoPhase)
 
       myTyperPhase = phaseOfClass(classOf[FrontEnd])
+      myPostTyperPhase = phaseOfClass(classOf[PostTyper])
       mySbtExtractDependenciesPhase = phaseOfClass(classOf[sbt.ExtractDependencies])
       myPicklerPhase = phaseOfClass(classOf[Pickler])
+      myReifyQuotesPhase = phaseOfClass(classOf[ReifyQuotes])
       myCollectNullableFieldsPhase = phaseOfClass(classOf[CollectNullableFields])
       myRefChecksPhase = phaseOfClass(classOf[RefChecks])
       myElimRepeatedPhase = phaseOfClass(classOf[ElimRepeated])
@@ -262,7 +277,7 @@ object Phases {
     final def isAfterTyper(phase: Phase): Boolean = phase.id > typerPhase.id
   }
 
-  trait Phase {
+  abstract class Phase {
 
     /** A name given to the `Phase` that can be used to debug the compiler. For
      *  instance, it is possible to print trees after a given phase using:
@@ -275,6 +290,10 @@ object Phases {
 
     def isRunnable(implicit ctx: Context): Boolean =
       !ctx.reporter.hasErrors
+        // TODO: This might test an unintended condition.
+        // To find out whether any errors have been reported during this
+        // run one calls `errorsReported`, not `hasErrors`.
+        // But maybe changing this would prevent useful phases from running?
 
     /** If set, allow missing or superfluous arguments in applications
      *  and type applications.
@@ -320,6 +339,11 @@ object Phases {
     /** Can this transform change the parents of a class? */
     def changesParents: Boolean = false
 
+    /** Can this transform change the base types of a type? */
+    def changesBaseTypes: Boolean = changesParents
+
+    def isEnabled(implicit ctx: Context): Boolean = true
+
     def exists: Boolean = true
 
     def initContext(ctx: FreshContext): Unit = ()
@@ -332,6 +356,7 @@ object Phases {
 
     private[this] var mySameMembersStartId = NoPhaseId
     private[this] var mySameParentsStartId = NoPhaseId
+    private[this] var mySameBaseTypesStartId = NoPhaseId
 
     /** The sequence position of this phase in the given context where 0
      * is reserved for NoPhase and the first real phase is at position 1.
@@ -351,6 +376,8 @@ object Phases {
       // id of first phase where all symbols are guaranteed to have the same members as in this phase
     final def sameParentsStartId: Int = mySameParentsStartId
       // id of first phase where all symbols are guaranteed to have the same parents as in this phase
+    final def sameBaseTypesStartId: Int = mySameBaseTypesStartId
+      // id of first phase where all symbols are guaranteed to have the same base tpyes as in this phase
 
     protected[Phases] def init(base: ContextBase, start: Int, end: Int): Unit = {
       if (start >= FirstPhaseId)
@@ -358,11 +385,12 @@ object Phases {
       assert(start <= Periods.MaxPossiblePhaseId, s"Too many phases, Period bits overflow")
       myBase = base
       myPeriod = Period(NoRunId, start, end)
-      myErasedTypes  = prev.getClass == classOf[Erasure]      || prev.erasedTypes
-      myFlatClasses  = prev.getClass == classOf[Flatten]      || prev.flatClasses
-      myRefChecked   = prev.getClass == classOf[RefChecks]    || prev.refChecked
+      myErasedTypes  = prev.getClass == classOf[Erasure]   || prev.erasedTypes
+      myFlatClasses  = prev.getClass == classOf[Flatten]   || prev.flatClasses
+      myRefChecked   = prev.getClass == classOf[RefChecks] || prev.refChecked
       mySameMembersStartId = if (changesMembers) id else prev.sameMembersStartId
       mySameParentsStartId = if (changesParents) id else prev.sameParentsStartId
+      mySameBaseTypesStartId = if (changesBaseTypes) id else prev.sameBaseTypesStartId
     }
 
     protected[Phases] def init(base: ContextBase, id: Int): Unit = init(base, id, id)

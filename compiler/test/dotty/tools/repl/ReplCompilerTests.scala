@@ -5,6 +5,9 @@ import org.junit.{Ignore, Test}
 
 class ReplCompilerTests extends ReplTest {
 
+  private def lines() =
+    storedOutput().trim.linesIterator.toList
+
   @Test def compileSingle = fromInitialState { implicit state =>
     run("def foo: 1 = 1")
     assertEquals("def foo: Int(1)", storedOutput().trim)
@@ -45,13 +48,13 @@ class ReplCompilerTests extends ReplTest {
 
     val expected = List(
       "def foo: Int",
-      "val x: Int = 10",
       "val res0: Int = 2",
-      "var y: Int = 5",
-      "val res1: Int = 20"
+      "val res1: Int = 20",
+      "val x: Int = 10",
+      "var y: Int = 5"
     )
 
-    assertEquals(expected, storedOutput().split("\n").toList)
+    assertEquals(expected, lines())
   }
 
   @Test def testImportMutable =
@@ -122,6 +125,44 @@ class ReplCompilerTests extends ReplTest {
     )
 
     run(source)
-    assertEquals(expected, storedOutput().split("\n").toList)
+    assertEquals(expected, lines())
   }
+
+  @Test def i5897 =
+    fromInitialState { implicit state => run("implied for Int = 10") }
+    .andThen         { implicit state =>
+      assertEquals(
+        "def Int_instance: Int",
+        storedOutput().trim
+      )
+      run("implicitly[Int]")
+      assertEquals(
+        "val res0: Int = 10",
+        storedOutput().trim
+      )
+    }
+
+  @Test def i6200 =
+    fromInitialState { implicit state =>
+      run("""
+        |trait Ord[T] {
+        |  def compare(x: T, y: T): Int
+        |  def (x: T) < (y: T) = compare(x, y) < 0
+        |  def (x: T) > (y: T) = compare(x, y) > 0
+        |}
+        |
+        |implied IntOrd for Ord[Int] {
+        |  def compare(x: Int, y: Int) =
+        |  if (x < y) -1 else if (x > y) +1 else 0
+        |}
+      """.stripMargin) }
+    .andThen         { implicit state =>
+      assertEquals(
+        """// defined trait Ord
+          |// defined object IntOrd""".stripMargin,
+        storedOutput().trim
+      )
+      run("IntOrd")
+      assertTrue(storedOutput().startsWith("val res0: IntOrd.type ="))
+    }
 }
